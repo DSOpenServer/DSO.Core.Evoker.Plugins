@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="DSO.Core.Evoker.PluginHost\**" />
+    <Compile Remove="DSO.Core.Evoker.Plugins.TestApi\**" />
+    <Compile Remove="SamplePlugin\**" />
+    <EmbeddedResource Remove="DSO.Core.Evoker.PluginHost\**" />
+    <EmbeddedResource Remove="DSO.Core.Evoker.Plugins.TestApi\**" />
+    <EmbeddedResource Remove="SamplePlugin\**" />
+    <None Remove="DSO.Core.Evoker.PluginHost\**" />
+    <None Remove="DSO.Core.Evoker.Plugins.TestApi\**" />
+    <None Remove="SamplePlugin\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Reflection.MetadataLoadContext" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DSO.Core.Evoker\DSO.Core.Evoker.csproj" />
+    <ProjectReference Include="..\DSO.Core.SchemaBinarySerializer\DSO.Core.SchemaBinarySerializer.csproj" />
+  </ItemGroup>
+
+</Project>

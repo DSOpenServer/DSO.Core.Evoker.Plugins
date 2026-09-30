@@ -1,0 +1,122 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v6.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v6.0": {
+      "DSO.Core.Evoker.PluginHost/1.0.0": {
+        "dependencies": {
+          "DSO.Core.Evoker.Plugins": "1.0.0"
+        },
+        "runtime": {
+          "DSO.Core.Evoker.PluginHost.dll": {}
+        }
+      },
+      "System.Collections.Immutable/8.0.0": {
+        "runtime": {
+          "lib/net6.0/System.Collections.Immutable.dll": {
+            "assemblyVersion": "8.0.0.0",
+            "fileVersion": "8.0.23.53103"
+          }
+        }
+      },
+      "System.Reflection.Metadata/8.0.1": {
+        "dependencies": {
+          "System.Collections.Immutable": "8.0.0"
+        },
+        "runtime": {
+          "lib/net6.0/System.Reflection.Metadata.dll": {
+            "assemblyVersion": "8.0.0.0",
+            "fileVersion": "8.0.1024.46610"
+          }
+        }
+      },
+      "System.Reflection.MetadataLoadContext/8.0.1": {
+        "dependencies": {
+          "System.Collections.Immutable": "8.0.0",
+          "System.Reflection.Metadata": "8.0.1"
+        },
+        "runtime": {
+          "lib/net6.0/System.Reflection.MetadataLoadContext.dll": {
+            "assemblyVersion": "8.0.0.1",
+            "fileVersion": "8.0.1024.46610"
+          }
+        }
+      },
+      "DSO.Core.Evoker/1.0.0": {
+        "runtime": {
+          "DSO.Core.Evoker.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      },
+      "DSO.Core.Evoker.Plugins/1.0.0": {
+        "dependencies": {
+          "DSO.Core.Evoker": "1.0.0",
+          "DSO.Core.SchemaBinarySerializer": "1.0.0",
+          "System.Reflection.MetadataLoadContext": "8.0.1"
+        },
+        "runtime": {
+          "DSO.Core.Evoker.Plugins.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      },
+      "DSO.Core.SchemaBinarySerializer/1.0.0": {
+        "runtime": {
+          "DSO.Core.SchemaBinarySerializer.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "DSO.Core.Evoker.PluginHost/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "System.Collections.Immutable/8.0.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-AurL6Y5BA1WotzlEvVaIDpqzpIPvYnnldxru8oXJU2yFxFUy3+pNXjXd1ymO+RA0rq0+590Q8gaz2l3Sr7fmqg==",
+      "path": "system.collections.immutable/8.0.0",
+      "hashPath": "system.collections.immutable.8.0.0.nupkg.sha512"
+    },
+    "System.Reflection.Metadata/8.0.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-+4sz5vGHPlo+5NpAxf2IlABnqVvOHOxv17b4dONv4hVwyNeFAeBevT14DIn7X3YWQ+eQFYO3YeTBNCleAblOKA==",
+      "path": "system.reflection.metadata/8.0.1",
+      "hashPath": "system.reflection.metadata.8.0.1.nupkg.sha512"
+    },
+    "System.Reflection.MetadataLoadContext/8.0.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-c/hiLzoMeYWnoTsdeRY2o0Vbadfedt0b4ZawQ+qDr1BIoYBQo3ASei0Pyiz00n9pHBlfWXiUVy90tOWBEgJ8/Q==",
+      "path": "system.reflection.metadataloadcontext/8.0.1",
+      "hashPath": "system.reflection.metadataloadcontext.8.0.1.nupkg.sha512"
+    },
+    "DSO.Core.Evoker/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "DSO.Core.Evoker.Plugins/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "DSO.Core.SchemaBinarySerializer/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

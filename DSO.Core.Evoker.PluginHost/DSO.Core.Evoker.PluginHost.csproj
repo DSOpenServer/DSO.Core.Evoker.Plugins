@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>DSO.Core.Evoker.PluginHost</RootNamespace>
+    <AssemblyName>DSO.Core.Evoker.PluginHost</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Worker process: DSO.Core.Evoker.Plugins.Sandbox içindeki protokol tiplerini,
+         DSO.Core.Evoker.Plugins.Loading.ManagedDotNetPluginLoader'ı ve dolayısıyla
+         EvokerEngine'i (Plugins projesi üzerinden) kullanır. -->    
+    <ProjectReference Include="..\DSO.Core.Evoker.Plugins.csproj" />
+  </ItemGroup>
+
+</Project>
