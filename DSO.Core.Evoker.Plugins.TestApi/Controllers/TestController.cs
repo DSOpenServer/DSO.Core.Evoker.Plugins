@@ -25,5 +25,11 @@ namespace DSO.Core.Evoker.Plugins.TestApi.Controllers
         {
             await PluginsTest.Test3BuilderParityTest();
         }
+
+        [HttpGet("Test4TestParite")]
+        public async Task Test4TestParite()
+        {
+            await PariteTesti.TestParite();
+        }
     }
 }

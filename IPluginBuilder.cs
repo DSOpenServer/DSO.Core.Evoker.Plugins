@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace DSO.Core.Evoker.Plugins
@@ -50,6 +51,16 @@ namespace DSO.Core.Evoker.Plugins
         void Execute(string methodName, params object?[] args);
         Task ExecuteAsync(string methodName, params object?[] args);
 
+        // --- Toplu çağrı ---
+        /// <summary>
+        /// Aynı metodu N argüman setiyle, sırayla çağırır; sonuçlar aynı sırayla döner. Sandbox'ta hepsi
+        /// tek (ya da parçalı - bkz. SandboxBuilder.BatchChunkSize) mesajla gider: process sınırı maliyeti N'e
+        /// bölünür (milyonlarca çağrılık döngüler için). Bir çağrı hata verirse PluginInvocationException
+        /// fırlatılır, BatchIndex hata verenin sırasıdır (öncekiler çalışmıştır).
+        /// </summary>
+        Task<T?[]> InvokeBatchAsync<T>(string methodName, IReadOnlyList<object?[]> argsList);
+        Task ExecuteBatchAsync(string methodName, IReadOnlyList<object?[]> argsList);
+
         // --- Property / field ---
         T? GetValue<T>(string memberName);
         void SetValue<T>(string memberName, T value);
@@ -61,6 +72,21 @@ namespace DSO.Core.Evoker.Plugins
         Func<object?[], Task<T?>> GetFuncAsync<T>(string methodName, object?[]? sampleArgs = null);
         Action<object?[]> GetAction(string methodName, object?[]? sampleArgs = null);
         Func<object?[], Task> GetActionAsync(string methodName, object?[]? sampleArgs = null);
+
+        // --- Event'ler ---
+        /// <summary>
+        /// Plugin event'ine abone ol; dönen nesne Dispose edilince çıkılır. Argümanlar için bkz. PluginEventArgs
+        /// (tipli okuma: e.Get&lt;T&gt;(i)). İsim büyük/küçük harf duyarsız da bulunur; IncludeNonPublic ise private
+        /// event'ler de. Static event'ler de desteklenir.
+        /// FARK: in-process'te handler plugin'in event'i tetiklediği thread'de SENKRON çağrılır; sandbox'ta host'ta
+        /// ayrı bir thread'de, tetiklenme sırasıyla, ASENKRON (plugin beklemez). İki modda da handler'ın fırlattığı
+        /// exception plugin'e yansımaz. Sandbox'ta worker yeniden başlarsa abonelik kendiliğinden yenilenir.
+        /// </summary>
+        IDisposable Subscribe(string eventName, Action<PluginEventArgs> handler);
+        Task<IDisposable> SubscribeAsync(string eventName, Action<PluginEventArgs> handler);
+
+        /// <summary>Plugin tipinin (IncludeNonPublic'e göre görülebilen) event adları.</summary>
+        string[] GetEventNames();
 
         // --- Cache ---
         /// <summary>Plugin tipinin DynamicEntityAccessor cache'ini temizler (sandbox'ta worker içinde).</summary>

@@ -10,7 +10,13 @@
         Set = 2,
 
         /// <summary>Worker'daki builder.ForgetCache() (DynamicEntityAccessor cache'i). MemberName/Value kullanılmaz.</summary>
-        ForgetCache = 3
+        ForgetCache = 3,
+
+        /// <summary>MemberName = event adı, Value = Int32 abonelik id'si (host belirler). Sonrasında worker EventRaised gönderir.</summary>
+        Subscribe = 4,
+
+        /// <summary>Value = Int32 abonelik id'si.</summary>
+        Unsubscribe = 5
     }
 
     /// <summary>

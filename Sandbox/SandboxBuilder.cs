@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -47,6 +48,65 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         public object? Invoke(string methodName, params object?[] args) => Sync(InvokeAsync(methodName, args));
         public T? Invoke<T>(string methodName, params object?[] args) => Sync(InvokeAsync<T>(methodName, args));
         public void Execute(string methodName, params object?[] args) => Sync(ExecuteAsync(methodName, args));
+
+        // --- Toplu çağrı ---
+
+        /// <summary>Bir IPC mesajına konacak en fazla çağrı sayısı (büyük listeler bu boyutta parçalanır). Varsayılan 1000.</summary>
+        public int BatchChunkSize { get; set; } = 1000;
+
+        public async Task<T?[]> InvokeBatchAsync<T>(string methodName, IReadOnlyList<object?[]> argsList)
+        {
+            var raw = await InvokeBatchRawAsync(methodName, argsList).ConfigureAwait(false);
+            var results = new T?[raw.Length];
+            for (int i = 0; i < raw.Length; i++) results[i] = WireValueCodec.ToObject<T>(raw[i]);
+            return results;
+        }
+
+        public Task ExecuteBatchAsync(string methodName, IReadOnlyList<object?[]> argsList) => InvokeBatchRawAsync(methodName, argsList);
+
+        private async Task<WireValue[]> InvokeBatchRawAsync(string methodName, IReadOnlyList<object?[]> argsList)
+        {
+            RequireName(methodName, nameof(methodName));
+            if (argsList == null) throw new ArgumentNullException(nameof(argsList));
+            if (argsList.Count == 0) return Array.Empty<WireValue>();
+
+            var all = new WireValue[argsList.Count];
+            int chunk = Math.Max(1, BatchChunkSize);
+            for (int start = 0; start < argsList.Count; start += chunk)
+            {
+                int len = Math.Min(chunk, argsList.Count - start);
+                var wire = new WireValue[len][];
+                for (int i = 0; i < len; i++)
+                {
+                    var a = argsList[start + i] ?? Array.Empty<object?>();
+                    wire[i] = new WireValue[a.Length];
+                    for (int j = 0; j < a.Length; j++) wire[i][j] = WireValueCodec.FromObject(a[j]);
+                }
+                // Metot, parçanın İLK elemanının argüman şekliyle çözülür (EvokerBuilder.GetFunc'ın sampleArgs'ı gibi);
+                // gerçek overload seçimi worker'da her çağrı için argüman değerlerine göre yapılır.
+                var codes = wire[0].Select(w => w.TypeCode).ToArray();
+
+                for (int attempt = 0; ; attempt++)
+                {
+                    int handle = await _handle.ResolveCachedAsync(methodName, codes).ConfigureAwait(false);
+                    InvokeBatchReply reply;
+                    try
+                    {
+                        reply = await _handle.InvokeBatchAsync(handle, wire, DefaultTimeoutMs).ConfigureAwait(false);
+                    }
+                    catch (StaleMethodHandleException) when (attempt == 0)
+                    {
+                        _handle.ForgetCachedHandle(methodName, codes);
+                        continue;
+                    }
+                    if (!reply.Success)
+                        throw PluginInvocationException.FromRemote(methodName, reply.ExceptionType, reply.ExceptionMessage, start + reply.FailedIndex);
+                    Array.Copy(reply.Results, 0, all, start, reply.Results.Length);
+                    break;
+                }
+            }
+            return all;
+        }
 
         // --- Property / field ---
 
@@ -142,6 +202,26 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                     return reply.Result ?? WireValue.Null;
                 }
             };
+        }
+
+        // --- Event'ler ---
+
+        public async Task<IDisposable> SubscribeAsync(string eventName, Action<PluginEventArgs> handler)
+            => await _handle.SubscribeAsync(eventName, handler).ConfigureAwait(false);
+
+        public IDisposable Subscribe(string eventName, Action<PluginEventArgs> handler) => Sync(SubscribeAsync(eventName, handler));
+
+        private string[]? _eventNames;
+
+        /// <summary>Worker'a sormadan, plugin DLL'ini ÇALIŞTIRMADAN (MetadataLoadContext ile) okunur ve cache'lenir.</summary>
+        public string[] GetEventNames()
+        {
+            if (_eventNames != null) return _eventNames;
+            var scan = Scanning.PluginScanner.Scan(_handle.PluginFilePath);
+            var type = scan.Types.FirstOrDefault(t => string.Equals(t.FullName, TypeFullName, StringComparison.OrdinalIgnoreCase));
+            // NOT: tarayıcı sadece public yüzeyi listeler; IncludeNonPublic ise private event'lere abone olunabilir
+            // ama burada listelenmezler.
+            return _eventNames = type?.Events.Select(e => e.Name).Distinct().ToArray() ?? Array.Empty<string>();
         }
 
         // --- Cache ---

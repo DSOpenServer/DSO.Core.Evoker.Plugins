@@ -221,6 +221,108 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             return new MemberRequest { CorrelationId = correlationId, Operation = operation, MemberName = memberName, Value = value };
         }
 
+        // --- InvokeBatchRequest: [CorrelationId long][MethodHandle int][Count int]{[ArgCount int][WireValue]*}* ---
+
+        public static byte[] EncodeInvokeBatchRequest(InvokeBatchRequest request)
+        {
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms, Encoding.UTF8);
+            bw.Write(request.CorrelationId);
+            bw.Write(request.MethodHandle);
+            bw.Write(request.ArgsList.Length);
+            foreach (var args in request.ArgsList)
+            {
+                bw.Write(args.Length);
+                foreach (var a in args) WriteWireValue(bw, a);
+            }
+            return ms.ToArray();
+        }
+
+        public static InvokeBatchRequest DecodeInvokeBatchRequest(byte[] payload)
+        {
+            using var ms = new MemoryStream(payload);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+            long cid = br.ReadInt64();
+            int handle = br.ReadInt32();
+            int n = br.ReadInt32();
+            var list = new WireValue[n][];
+            for (int i = 0; i < n; i++)
+            {
+                int c = br.ReadInt32();
+                var args = new WireValue[c];
+                for (int j = 0; j < c; j++) args[j] = ReadWireValue(br);
+                list[i] = args;
+            }
+            return new InvokeBatchRequest { CorrelationId = cid, MethodHandle = handle, ArgsList = list };
+        }
+
+        // --- InvokeBatchReply: [CorrelationId long][Success]{[Count int][WireValue]* | [FailedIndex int][ExType][ExMsg]} ---
+
+        public static byte[] EncodeInvokeBatchReply(InvokeBatchReply reply)
+        {
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms, Encoding.UTF8);
+            bw.Write(reply.CorrelationId);
+            bw.Write(reply.Success);
+            if (reply.Success)
+            {
+                bw.Write(reply.Results.Length);
+                foreach (var r in reply.Results) WriteWireValue(bw, r);
+            }
+            else
+            {
+                bw.Write(reply.FailedIndex);
+                bw.Write(reply.ExceptionType ?? "");
+                bw.Write(reply.ExceptionMessage ?? "");
+            }
+            return ms.ToArray();
+        }
+
+        public static InvokeBatchReply DecodeInvokeBatchReply(byte[] payload)
+        {
+            using var ms = new MemoryStream(payload);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+            long cid = br.ReadInt64();
+            if (br.ReadBoolean())
+            {
+                int n = br.ReadInt32();
+                var results = new WireValue[n];
+                for (int i = 0; i < n; i++) results[i] = ReadWireValue(br);
+                return new InvokeBatchReply { CorrelationId = cid, Success = true, Results = results };
+            }
+            return new InvokeBatchReply
+            {
+                CorrelationId = cid,
+                Success = false,
+                FailedIndex = br.ReadInt32(),
+                ExceptionType = br.ReadString(),
+                ExceptionMessage = br.ReadString()
+            };
+        }
+
+        // --- EventRaised: [SubscriptionId int][ArgCount int][WireValue]*ArgCount ---
+
+        public static byte[] EncodeEventRaised(int subscriptionId, WireValue[] args)
+        {
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms, Encoding.UTF8);
+            bw.Write(subscriptionId);
+            bw.Write(args.Length);
+            foreach (var a in args) WriteWireValue(bw, a);
+            return ms.ToArray();
+        }
+
+        public static (int SubscriptionId, WireValue[] Args) DecodeEventRaised(byte[] payload)
+        {
+            using var ms = new MemoryStream(payload);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+            int id = br.ReadInt32();
+            int n = br.ReadInt32();
+            var args = new WireValue[n];
+            for (int i = 0; i < n; i++) args[i] = ReadWireValue(br);
+            return (id, args);
+        }
+
         // --- WireValue: [TypeCode byte][RawLen int][Raw bytes] ---
         // NOT: primitive'ler için RawLen aslında TypeCode'dan zaten çıkarılabilir (sabit boyut),
         // ama tek tip bir framing (her zaman uzunluk öneki) hem yazan hem okuyan tarafı BASİT ve

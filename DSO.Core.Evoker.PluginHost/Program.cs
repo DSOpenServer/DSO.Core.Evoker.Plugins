@@ -30,7 +30,9 @@ string typeFullName = args[2];
 bool includeNonPublic = string.Equals(args[3], "true", StringComparison.OrdinalIgnoreCase);
 int maxConcurrency = int.TryParse(args[4], out var mc) && mc > 0 ? mc : 1;
 
-using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+// CurrentUserOnly: sadece AYNI kullanıcının açtığı pipe'a bağlan (başka bir kullanıcının aynı isimle
+// açtığı sahte bir pipe'a plugin'i bağlamayız). Host tarafı da aynı bayrakla açıyor.
+using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
 try
 {
     using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -64,6 +66,18 @@ catch (Exception ex)
 var handleTable = new System.Collections.Concurrent.ConcurrentDictionary<int, (string MethodName, MethodInfo Representative)>();
 int handleCounter = 0;
 var concurrencyGate = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+// Event abonelikleri: host'un verdiği abonelik id'si -> worker'daki gerçek abonelik (Dispose = çık).
+var eventSubscriptions = new System.Collections.Concurrent.ConcurrentDictionary<int, IDisposable>();
+// Plugin event'leri plugin'in KENDİ thread'lerinden (ör. arka arkaya ilerleme bildirimleri) gelir; sıralarının
+// korunması için tek bir tüketici bunları sırayla pipe'a yazar. Plugin thread'i ASLA pipe yazımını beklemez.
+var eventOutbox = System.Threading.Channels.Channel.CreateUnbounded<(int Id, WireValue[] Args)>(
+    new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true });
+_ = Task.Run(async () =>
+{
+    await foreach (var (id, eventArgs) in eventOutbox.Reader.ReadAllAsync().ConfigureAwait(false))
+        await SafeWriteAsync(() => writer.WriteEventRaisedAsync(id, eventArgs)).ConfigureAwait(false);
+});
+
 // Member (property/field) erişimi için üye başına tip-özel getter/setter cache'i (bkz. HandleMemberAsync).
 var memberAccessors = new System.Collections.Concurrent.ConcurrentDictionary<string, (Type MemberType, Func<object?> Get, Action<object?> Set)>();
 var bindingFlags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static
@@ -103,6 +117,10 @@ while (true)
             _ = HandleInvokeAsync(invokeRequest);
             break;
 
+        case IpcMessageType.InvokeBatch:
+            _ = HandleInvokeBatchAsync(IpcMessageCodec.DecodeInvokeBatchRequest(payload));
+            break;
+
         case IpcMessageType.Member:
             // Invoke ile aynı: arka plana at, AYNI concurrency gate'ten geç (MaxConcurrency=1 iken bir
             // alan, plugin'in bir metodu çalışırken araya girip yazılamaz).
@@ -134,19 +152,25 @@ void HandleResolve(ResolveRequest request)
     }
     else
     {
-        var candidates = loadedType.GetMethods(bindingFlags).Where(m => m.Name == request.MethodName).ToList();
+        // Invoke ile AYNI kural (EvokerBuilder.FindMethodCandidates): birebir/case-insensitive isim +
+        // argüman sayısı (fazla parametreler optional olabilir - VB.NET). Gerçek overload seçimi Invoke
+        // sırasında, argüman DEĞERLERİNE bakan EvokerBuilder.FindMethod ile yapılır; burada sadece
+        // "çağrılabilir bir metot var mı" fail-fast kontrolü + parametre tipi ipucu (decode için).
+        var candidates = loader.Builder!.FindMethodCandidates(request.MethodName, request.ArgTypeCodes.Count);
         if (candidates.Count == 0)
         {
-            reply = new ResolveReply { Success = false, Error = $"'{request.MethodName}' metodu bulunamadı." };
+            bool anyByName = loadedType.GetMethods(bindingFlags).Any(m => string.Equals(m.Name, request.MethodName, StringComparison.OrdinalIgnoreCase));
+            reply = new ResolveReply
+            {
+                Success = false,
+                Error = anyByName
+                    ? $"'{request.MethodName}' için {request.ArgTypeCodes.Count} argümanla çağrılabilen bir overload yok."
+                    : $"'{request.MethodName}' metodu bulunamadı."
+            };
         }
         else
         {
-            // NOT (bilinen sınırlama - EvokerBuilder/EvokerBuilderDynamicInvokeExtensions'daki ile
-            // AYNI ruhta): burada TAM overload çözümü yapılmıyor, sadece "böyle bir metot var mı" fail-fast
-            // kontrolü + iyi bir parametre-tipi ipucu seçimi. GERÇEK overload seçimi Invoke sırasında,
-            // builder.InvokeDynamicAsync -> EvokerBuilder.GetMethodInfo'nun ÇÖZÜLMÜŞ argüman
-            // DEĞERLERİNE bakan, zaten test edilmiş mantığıyla yapılır.
-            var representative = candidates.FirstOrDefault(m => m.GetParameters().Length == request.ArgTypeCodes.Count) ?? candidates[0];
+            var representative = candidates[0];
             int handle = Interlocked.Increment(ref handleCounter);
             handleTable[handle] = (request.MethodName, representative);
             reply = new ResolveReply { Success = true, MethodHandle = handle };
@@ -177,19 +201,7 @@ async Task HandleInvokeAsync(InvokeRequest request)
             try
             {
                 var paramTypes = entry.Representative.GetParameters().Select(p => p.ParameterType).ToArray();
-                var decodedArgs = new object?[request.Args.Length];
-                for (int i = 0; i < request.Args.Length; i++)
-                {
-                    var hint = i < paramTypes.Length ? paramTypes[i] : null;
-                    var decoded = WireValueCodec.ToObject(request.Args[i], hint);
-                    // Enum'lar tel üzerinde sayı olarak gelir, tipi belirsiz Complex'ler JsonElement olarak -
-                    // parametre tipine SADECE bu iki durumda çeviriyoruz (diğer durumlarda overload seçimini
-                    // EvokerBuilder argümanların GERÇEK tiplerine bakarak yapsın).
-                    if (hint != null && decoded != null &&
-                        ((Nullable.GetUnderlyingType(hint) ?? hint).IsEnum || decoded is System.Text.Json.JsonElement))
-                        decoded = WireValueCodec.ConvertTo(decoded, hint);
-                    decodedArgs[i] = decoded;
-                }
+                var decodedArgs = DecodeArgs(request.Args, paramTypes);
 
                 // builder.InvokeDynamicAsync: void/Task/Task<T>/senkron şeklini kendisi tespit
                 // eder (bkz. EvokerBuilderDynamicInvokeExtensions) - burada TEKRAR yazılmıyor.
@@ -223,6 +235,63 @@ async Task HandleInvokeAsync(InvokeRequest request)
     await SafeWriteAsync(() => writer.WriteInvokeReplyAsync(reply)).ConfigureAwait(false);
 }
 
+object?[] DecodeArgs(WireValue[] wireArgs, Type[] paramTypes)
+{
+    var decodedArgs = new object?[wireArgs.Length];
+    for (int i = 0; i < wireArgs.Length; i++)
+    {
+        var hint = i < paramTypes.Length ? paramTypes[i] : null;
+        var decoded = WireValueCodec.ToObject(wireArgs[i], hint);
+        // Enum'lar tel üzerinde sayı olarak gelir, tipi belirsiz Complex'ler JsonElement olarak -
+        // parametre tipine SADECE bu iki durumda çeviriyoruz (diğer durumlarda overload seçimini
+        // EvokerBuilder argümanların GERÇEK tiplerine bakarak yapsın).
+        if (hint != null && decoded != null &&
+            ((Nullable.GetUnderlyingType(hint) ?? hint).IsEnum || decoded is System.Text.Json.JsonElement))
+            decoded = WireValueCodec.ConvertTo(decoded, hint);
+        decodedArgs[i] = decoded;
+    }
+    return decodedArgs;
+}
+
+async Task HandleInvokeBatchAsync(InvokeBatchRequest request)
+{
+    await concurrencyGate.WaitAsync().ConfigureAwait(false);
+    InvokeBatchReply reply;
+    int index = 0;
+    try
+    {
+        if (!handleTable.TryGetValue(request.MethodHandle, out var entry))
+            throw new MissingMethodException($"Bilinmeyen MethodHandle: {request.MethodHandle} (önce Resolve çağrılmalı).");
+
+        var paramTypes = entry.Representative.GetParameters().Select(p => p.ParameterType).ToArray();
+        var results = new WireValue[request.ArgsList.Length];
+        for (index = 0; index < request.ArgsList.Length; index++)
+        {
+            var result = await loader.Builder!.InvokeDynamicAsync(entry.MethodName, DecodeArgs(request.ArgsList[index], paramTypes)).ConfigureAwait(false);
+            results[index] = WireValueCodec.FromObject(result);
+        }
+        reply = new InvokeBatchReply { CorrelationId = request.CorrelationId, Success = true, Results = results };
+    }
+    catch (Exception ex)
+    {
+        var actual = ex is TargetInvocationException { InnerException: { } inner } ? inner : ex;
+        reply = new InvokeBatchReply
+        {
+            CorrelationId = request.CorrelationId,
+            Success = false,
+            FailedIndex = index,
+            ExceptionType = actual.GetType().FullName,
+            ExceptionMessage = actual.Message
+        };
+    }
+    finally
+    {
+        concurrencyGate.Release();
+    }
+
+    await SafeWriteAsync(() => writer.WriteInvokeBatchReplyAsync(reply)).ConfigureAwait(false);
+}
+
 // --- Member (property/field get/set, ForgetCache) ---
 // builder.GetValue<T>/SetValue<T> generic - worker, T'yi üyenin GERÇEK tipinden (reflection ile, üye
 // başına BİR KEZ) bulup kapalı generic metodu delegate olarak cache'liyor. Böylece host tarafının tip
@@ -237,6 +306,8 @@ async Task HandleInvokeAsync(InvokeRequest request)
             | (includeNonPublic ? BindingFlags.NonPublic : 0);
         Type memberType = type.GetProperty(name, flags)?.PropertyType
             ?? type.GetField(name, flags)?.FieldType
+            ?? SingleIgnoreCase(type.GetProperties(flags), name)?.PropertyType
+            ?? SingleIgnoreCase(type.GetFields(flags), name)?.FieldType
             ?? throw new MissingMemberException(type.Name, name);
 
         var getOpen = typeof(DSO.Core.Evoker.EvokerBuilderPropertyExtensions).GetMethod(nameof(DSO.Core.Evoker.EvokerBuilderPropertyExtensions.GetValue))!;
@@ -249,6 +320,12 @@ async Task HandleInvokeAsync(InvokeRequest request)
             () => getClosed.Invoke(null, new object?[] { builder, name }),
             v => setClosed.Invoke(null, new object?[] { builder, name, v }));
     });
+}
+
+static T? SingleIgnoreCase<T>(T[] members, string name) where T : MemberInfo
+{
+    var m = members.Where(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase)).ToList();
+    return m.Count == 1 ? m[0] : null;
 }
 
 async Task HandleMemberAsync(MemberRequest request)
@@ -268,6 +345,36 @@ async Task HandleMemberAsync(MemberRequest request)
                 var value = WireValueCodec.ConvertTo(WireValueCodec.ToObject(request.Value, accessor.MemberType), accessor.MemberType);
                 accessor.Set(value);
                 break;
+            case MemberOperation.Subscribe:
+                {
+                    int subId = (int)WireValueCodec.ToObject(request.Value)!;
+                    var instance = loader.Builder!.Instance;
+                    var sub = DSO.Core.Evoker.EvokerBuilderEventExtensions.AddEventHandler(loader.Builder!, request.MemberName, raw =>
+                    {
+                        var wire = new WireValue[raw.Length];
+                        for (int i = 0; i < raw.Length; i++)
+                        {
+                            // Plugin'in kendisi (sender) process sınırını geçemez -> null (bkz. PluginEventArgs).
+                            var a = ReferenceEquals(raw[i], instance) ? null : raw[i];
+                            try { wire[i] = WireValueCodec.FromObject(a); }
+                            catch (Exception ex)
+                            {
+                                // Serileştirilemeyen argüman event'i DÜŞÜRMESİN - o argüman null gider, sebep stderr'e.
+                                Console.Error.WriteLine($"[PluginHost] '{request.MemberName}' event argümanı {i} serileştirilemedi: {ex.Message}");
+                                wire[i] = WireValue.Null;
+                            }
+                        }
+                        eventOutbox.Writer.TryWrite((subId, wire));
+                    });
+                    eventSubscriptions[subId] = sub;
+                    break;
+                }
+            case MemberOperation.Unsubscribe:
+                {
+                    int subId = (int)WireValueCodec.ToObject(request.Value)!;
+                    if (eventSubscriptions.TryRemove(subId, out var sub)) sub.Dispose();
+                    break;
+                }
             case MemberOperation.ForgetCache:
                 DSO.Core.Evoker.EvokerBuilderPropertyExtensions.ForgetCache(loader.Builder!);
                 memberAccessors.Clear();

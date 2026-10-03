@@ -5,6 +5,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace DSO.Core.Evoker.Plugins.Sandbox
 {
@@ -23,6 +24,57 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
     /// </summary>
     public static class WireValueCodec
     {
+        // System.Text.Json, serialize ettiği her tipin metadata'sını KULLANDIĞI options nesnesinde cache'ler.
+        // Varsayılan (global) options'ı kullansaydık, plugin'in tipleri (ör. Point) oraya kalıcı olarak
+        // yerleşir ve plugin'in AssemblyLoadContext'i ASLA unload edilemezdi. Bu yüzden kendi options
+        // nesnemizi kullanıyoruz ve unload'da (bkz. ForgetAssembly) yenisiyle değiştiriyoruz.
+        private static JsonSerializerOptions _jsonOptions = new();
+        private static JsonSerializerOptions JsonOptions => Volatile.Read(ref _jsonOptions);
+
+        /// <summary>
+        /// Bu assembly'nin tiplerine dokunan tüm cache girdilerini (SchemaBinarySerializer köprüleri + JSON metadata) bırakır.
+        /// Plugin unload'u için - bkz. ManagedDotNetPluginLoader.UnloadAsync. JSON cache'i tip bazında
+        /// temizlenemediği için options nesnesi komple yenilenir (diğer tipler ilk kullanımda yeniden ısınır).
+        /// </summary>
+        public static void ForgetAssembly(Assembly assembly)
+        {
+            foreach (var t in SchemaSerializers.Keys)
+                if (Involves(t, assembly)) SchemaSerializers.TryRemove(t, out _);
+            foreach (var t in SchemaDeserializers.Keys)
+                if (Involves(t, assembly)) SchemaDeserializers.TryRemove(t, out _);
+            Volatile.Write(ref _jsonOptions, new JsonSerializerOptions());
+            ClearSystemTextJsonGlobalCaches();
+        }
+
+        // .NET 7+ System.Text.Json, aynı ayarlı options nesneleri arasında PAYLAŞILAN global statik cache'ler
+        // tutar (tip metadata'sı + derlenmiş üye erişimcileri). Yeni bir options nesnesi yaratmak bunları
+        // temizlemez - plugin tipleri orada kalır ve AssemblyLoadContext unload OLAMAZ (testte yakalandı).
+        // System.Text.Json bu cache'leri temizlemek için Hot Reload'a bir kanca sunar: assembly üzerindeki
+        // [MetadataUpdateHandler] tipinin static ClearCache(Type[]?) metodu. Aynı kancayı çağırıyoruz; bulunamazsa
+        // (farklı runtime sürümü) sessizce geçilir.
+        private static void ClearSystemTextJsonGlobalCaches()
+        {
+            try
+            {
+                var stj = typeof(JsonSerializer).Assembly;
+                foreach (var attr in stj.GetCustomAttributes<System.Reflection.Metadata.MetadataUpdateHandlerAttribute>())
+                {
+                    attr.HandlerType
+                        .GetMethod("ClearCache", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                        ?.Invoke(null, new object?[] { null });
+                }
+            }
+            catch
+            {
+                // Temizlik en iyi çaba ile yapılır; başarısızlık unload'u durdurmamalı (UnloadAsync false döner).
+            }
+        }
+
+        private static bool Involves(Type t, Assembly a) =>
+            t.Assembly == a
+            || (t.HasElementType && Involves(t.GetElementType()!, a))
+            || (t.IsGenericType && t.GetGenericArguments().Any(g => Involves(g, a)));
+
         public static WireValue FromObject(object? value)
         {
             if (value is null) return WireValue.Null;
@@ -133,7 +185,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             if (targetType.IsInstanceOfType(value) || underlying.IsInstanceOfType(value)) return value;
 
             if (value is JsonElement je)
-                return je.Deserialize(targetType);
+                return je.Deserialize(targetType, JsonOptions);
 
             if (underlying.IsEnum)
                 return value is string es ? Enum.Parse(underlying, es, ignoreCase: true) : Enum.ToObject(underlying, value);
@@ -143,8 +195,8 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
             // Son çare: JSON üzerinden şekil eşlemesi (ör. worker'ın gerçek Point'i host'ta yüklüyse ama
             // çağıran kendi PointDto'sunu istiyorsa).
-            var json = JsonSerializer.SerializeToUtf8Bytes(value, value.GetType());
-            return JsonSerializer.Deserialize(json, targetType);
+            var json = JsonSerializer.SerializeToUtf8Bytes(value, value.GetType(), JsonOptions);
+            return JsonSerializer.Deserialize(json, targetType, JsonOptions);
         }
 
         private static WireValue Fixed(WireTypeCode code, byte[] raw) => new WireValue { TypeCode = code, Raw = raw };
@@ -208,7 +260,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             byte[] payload;
             try
             {
-                payload = JsonSerializer.SerializeToUtf8Bytes(value, runtimeType);
+                payload = JsonSerializer.SerializeToUtf8Bytes(value, runtimeType, JsonOptions);
                 format = ComplexValueFormat.Json;
             }
             catch (Exception)
@@ -255,14 +307,14 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             if (resolvedType == typeof(object)) resolvedType = embeddedType; // object "istek" değil, ipucu yok demek
 
             if (resolvedType == typeof(JsonElement) && format == ComplexValueFormat.Json)
-                return JsonSerializer.Deserialize<JsonElement>(payload);
+                return JsonSerializer.Deserialize<JsonElement>(payload, JsonOptions);
 
             if (resolvedType == null)
             {
                 // Somut bir CLR tipi YOK - bkz. ToObject'in üstündeki "ÖNEMLİ" notu. Json için dinamik
                 // (JsonElement) decode'a düşüyoruz; SchemaBinarySerializer bir Type olmadan yorumlanamaz.
                 if (format == ComplexValueFormat.Json)
-                    return JsonSerializer.Deserialize<JsonElement>(payload);
+                    return JsonSerializer.Deserialize<JsonElement>(payload, JsonOptions);
 
                 throw new InvalidOperationException(
                     $"[WireValueCodec] Complex (SchemaBinarySerializer formatlı) değer için tip çözülemedi " +
@@ -273,7 +325,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
             return format switch
             {
-                ComplexValueFormat.Json => JsonSerializer.Deserialize(payload, resolvedType),
+                ComplexValueFormat.Json => JsonSerializer.Deserialize(payload, resolvedType, JsonOptions),
                 ComplexValueFormat.SchemaBinarySerializer => GetSchemaDeserializer(resolvedType)(payload),
                 _ => throw new NotSupportedException($"[WireValueCodec] Bilinmeyen ComplexValueFormat: {format}")
             };

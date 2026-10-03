@@ -34,6 +34,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         private SemaphoreSlim? _concurrencyGate;
         // TODO 13
         private readonly ConcurrentDictionary<long, TaskCompletionSource<InvokeReply>> _pending = new();
+        private readonly ConcurrentDictionary<long, TaskCompletionSource<InvokeBatchReply>> _pendingBatch = new();
         private long _correlationCounter;
         // Resolve'un kendi CorrelationId'si YOK (bkz. ResolveMessages.cs) - bu yüzden aynı anda
         // sadece BİR Resolve isteği beklenebilir, bu kilit onu garanti eder.
@@ -58,6 +59,22 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
         // CallAsync'in (isimle çağırma kolaylığı) kendi resolve cache'i - restart'ta temizlenir.
         private readonly ConcurrentDictionary<(string Method, string ArgShape), int> _callHandleCache = new();
+
+        // --- Event abonelikleri ---
+        // Host tarafında tutulan kayıt restart'tan SAĞ ÇIKAR: yeni worker'a otomatik yeniden abone olunur.
+        private readonly ConcurrentDictionary<int, (string EventName, Action<PluginEventArgs> Handler)> _eventSubs = new();
+        private int _eventSubCounter;
+        // EventRaised'lar okuma döngüsünden BURAYA bırakılır, tek bir dağıtıcı sırayla handler'ları çağırır:
+        // yavaş bir handler okuma döngüsünü (dolayısıyla Pong'ları/cevapları) bloklamaz, sıra korunur.
+        private readonly System.Threading.Channels.Channel<(int Id, WireValue[] Args)> _eventDispatch =
+            System.Threading.Channels.Channel.CreateUnbounded<(int, WireValue[])>(new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true });
+        private Task? _eventDispatchTask;
+
+        /// <summary>
+        /// Bir event handler'ı exception fırlattığında (handler host kodudur - plugin'i ETKİLEMEZ, sonraki
+        /// event'ler gelmeye devam eder). Bağlanmazsa hata System.Diagnostics.Trace'e yazılır.
+        /// </summary>
+        public event Action<PluginEventArgs, Exception>? EventHandlerFailed;
 
         /// <summary>Worker nesli - 1 = ilk başlatma, her auto-restart'ta +1. Tanılama amaçlı.</summary>
         public int Generation => Volatile.Read(ref _generation);
@@ -97,7 +114,11 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                     "yolunu (dll ya da exe) belirtmelisiniz.");
 
             string pipeName = "dso-plugin-" + Guid.NewGuid().ToString("N");
-            var pipeServer = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            // CurrentUserOnly: pipe'a SADECE bu process'i çalıştıran kullanıcı bağlanabilir (Windows'ta ACL,
+            // Unix'te soket izni + karşı tarafın kimlik kontrolü). Worker tarafı da aynı bayrakla, sadece aynı
+            // kullanıcının açtığı pipe'a bağlanır. Pipe adı ayrıca rastgele (GUID) ve tek bağlantılık.
+            var pipeServer = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
 
             var psi = new ProcessStartInfo
             {
@@ -210,6 +231,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             _lifetimeCts = new CancellationTokenSource();
             Interlocked.Increment(ref _generation);
 
+            _eventDispatchTask ??= Task.Run(EventDispatchLoopAsync);
             _readLoopTask = Task.Run(() => ReadLoopAsync(_lifetimeCts.Token));
             _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_lifetimeCts.Token));
         }
@@ -306,6 +328,68 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 }, ct),
                 timeoutMs, operation.ToString());
         }
+
+        /// <summary>
+        /// Toplu çağrı: aynı metoda N argüman seti, TEK frame, worker'da sırayla. Concurrency gate'ten BİR kez
+        /// geçer (tüm toplu iş tek bir "çağrı" sayılır). Hata olursa FailedIndex'e kadar olanlar çalışmıştır.
+        /// </summary>
+        public async Task<InvokeBatchReply> InvokeBatchAsync(int methodHandle, WireValue[][] argsList, int? timeoutMs = null)
+        {
+            EnsureAlive();
+            if (!_handleMap.TryGetValue(methodHandle, out var mapped))
+                return new InvokeBatchReply
+                {
+                    Success = false,
+                    FailedIndex = 0,
+                    ExceptionType = nameof(MissingMethodException),
+                    ExceptionMessage = $"Bilinmeyen MethodHandle: {methodHandle} (önce ResolveAsync çağrılmalı)."
+                };
+            if (mapped.Generation != Generation)
+                throw new StaleMethodHandleException(methodHandle, mapped.Generation, Generation);
+
+            await _concurrencyGate!.WaitAsync().ConfigureAwait(false);
+            long correlationId = Interlocked.Increment(ref _correlationCounter);
+            var tcs = new TaskCompletionSource<InvokeBatchReply>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingBatch[correlationId] = tcs;
+            try
+            {
+                await _writer!.WriteInvokeBatchRequestAsync(new InvokeBatchRequest
+                {
+                    CorrelationId = correlationId,
+                    MethodHandle = mapped.WorkerHandle,
+                    ArgsList = argsList
+                }).ConfigureAwait(false);
+
+                if (timeoutMs.HasValue)
+                {
+                    var winner = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs.Value)).ConfigureAwait(false);
+                    if (winner != tcs.Task)
+                        throw new TimeoutException($"[PluginWorkerHandle] InvokeBatch {timeoutMs.Value}ms içinde cevap vermedi (worker ETKİLENMEDİ).");
+                }
+                return await tcs.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                _pendingBatch.TryRemove(correlationId, out _);
+                _concurrencyGate.Release();
+            }
+        }
+
+        /// <summary>
+        /// (metot adı, argüman tip şekli) için public handle - cache'li; restart sonrası cache temizlenir.
+        /// CallRawAsync ve SandboxBuilder'ın toplu çağrısı bunu kullanır.
+        /// </summary>
+        internal async Task<int> ResolveCachedAsync(string methodName, WireTypeCode[] codes)
+        {
+            var key = (methodName, string.Join(",", codes));
+            if (_callHandleCache.TryGetValue(key, out int handle)) return handle;
+            handle = await ResolveAsync(TypeFullName, methodName, codes).ConfigureAwait(false);
+            _callHandleCache[key] = handle;
+            return handle;
+        }
+
+        internal void ForgetCachedHandle(string methodName, WireTypeCode[] codes) =>
+            _callHandleCache.TryRemove((methodName, string.Join(",", codes)), out _);
 
         // Invoke ve Member isteklerinin ortak yolu: gate -> CorrelationId -> yaz -> (opsiyonel timeout ile) bekle.
         private async Task<InvokeReply> SendAndWaitAsync(Func<long, CancellationToken, Task> write, int? timeoutMs, string what)
@@ -440,10 +524,10 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                         var ex = new TimeoutException(
                             $"[PluginWorkerHandle] Worker {Options.MissedHeartbeatsBeforeKill} heartbeat'e art arda cevap vermedi - " +
                             "hung/dead sayıldı, Process.Kill() ediliyor.");
+                        _pendingCrashReason = ex; // read loop'un catch'i (pipe kopunca) bunu asıl sebep olarak raporlar
                         KillQuietly(_process);
                         MarkDeadAndFailPending(ex);
-                        LogCrash(ex);
-                        // Restart kararı ve işlemi TEK bir yerde (read loop'un catch'i, pipe koptuğunda
+                        // Loglama/bildirim ve restart kararı ve işlemi TEK bir yerde (read loop'un catch'i, pipe koptuğunda
                         // zaten tetiklenecek) veriliyor - burada sadece kill ediyoruz, çift restart'ı
                         // önlemek için.
                         return;
@@ -486,6 +570,16 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                                 tcs.TrySetResult(reply);
                             break;
 
+                        case IpcMessageType.InvokeBatchReply:
+                            var batchReply = IpcMessageCodec.DecodeInvokeBatchReply(payload);
+                            if (_pendingBatch.TryRemove(batchReply.CorrelationId, out var btcs))
+                                btcs.TrySetResult(batchReply);
+                            break;
+
+                        case IpcMessageType.EventRaised:
+                            _eventDispatch.Writer.TryWrite(IpcMessageCodec.DecodeEventRaised(payload));
+                            break;
+
                         case IpcMessageType.Pong:
                             Interlocked.Exchange(ref _missedHeartbeats, 0);
                             break;
@@ -508,20 +602,26 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             }
             catch (Exception ex)
             {
-                // Beklenmedik kopma - "worker öldü".
-                MarkDeadAndFailPending(ex);
-                LogCrash(ex);
+                // Beklenmedik kopma - "worker öldü" (ya da heartbeat onu öldürdü - sebep oradan gelir).
+                var reason = Interlocked.Exchange(ref _pendingCrashReason, null) ?? ex;
+                MarkDeadAndFailPending(reason);
+                LogCrash(reason);
 
-                if (Options.AutoRestartOnCrash && !_restartedOnce && !_disposed && !_promoted)
+                bool willRestart = Options.AutoRestartOnCrash && !_restartedOnce && !_disposed && !_promoted;
+                RaiseCrashed(reason, willRestart);
+
+                if (willRestart)
                 {
                     _restartedOnce = true;
                     try
                     {
                         await RestartAsync().ConfigureAwait(false);
+                        RaiseRestarted();
                     }
                     catch (Exception restartEx)
                     {
                         LogCrash(restartEx);
+                        RaiseCrashed(restartEx, willRestart: false);
                     }
                 }
             }
@@ -547,8 +647,81 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             Interlocked.Exchange(ref _deadFlag, 0);
             Interlocked.Exchange(ref _missedHeartbeats, 0);
             _pending.Clear();
+            _pendingBatch.Clear();
 
             await LaunchAsync().ConfigureAwait(false);
+
+            // Host tarafında hâlâ açık olan abonelikleri yeni worker'da yeniden kur (aynı id'lerle).
+            foreach (var kv in _eventSubs)
+            {
+                try
+                {
+                    var reply = await MemberAsync(MemberOperation.Subscribe, kv.Value.EventName, WireValueCodec.FromObject(kv.Key)).ConfigureAwait(false);
+                    if (!reply.Success) LogCrash(new InvalidOperationException($"Restart sonrası '{kv.Value.EventName}' aboneliği yenilenemedi: {reply.ExceptionMessage}"));
+                }
+                catch (Exception ex) { LogCrash(ex); }
+            }
+        }
+
+        /// <summary>
+        /// Plugin event'ine abone ol. Handler, host'ta ayrı bir dağıtıcı thread'inde, event'lerin tetiklenme
+        /// SIRASIYLA çağrılır (plugin handler'ı beklemez - bildirim). Worker yeniden başlarsa abonelik
+        /// otomatik yenilenir. Dönen nesneyi Dispose/DisposeAsync ederek çıkın.
+        /// </summary>
+        public async Task<PluginEventSubscription> SubscribeAsync(string eventName, Action<PluginEventArgs> handler)
+        {
+            if (string.IsNullOrWhiteSpace(eventName)) throw new ArgumentException("eventName boş olamaz.", nameof(eventName));
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            EnsureAlive();
+
+            int id = Interlocked.Increment(ref _eventSubCounter);
+            _eventSubs[id] = (eventName, handler);
+            InvokeReply reply;
+            try
+            {
+                reply = await MemberAsync(MemberOperation.Subscribe, eventName, WireValueCodec.FromObject(id)).ConfigureAwait(false);
+            }
+            catch
+            {
+                _eventSubs.TryRemove(id, out _);
+                throw;
+            }
+            if (!reply.Success)
+            {
+                _eventSubs.TryRemove(id, out _);
+                throw PluginInvocationException.FromRemote(eventName, reply.ExceptionType, reply.ExceptionMessage);
+            }
+            return new PluginEventSubscription(this, id);
+        }
+
+        internal async Task UnsubscribeAsync(int id)
+        {
+            if (!_eventSubs.TryRemove(id, out var sub)) return;
+            if (_disposed || _promoted || IsDead || _process == null) return; // worker yok - yapacak iş yok
+            try { await MemberAsync(MemberOperation.Unsubscribe, sub.EventName, WireValueCodec.FromObject(id)).ConfigureAwait(false); }
+            catch { /* worker o arada öldüyse sorun değil */ }
+        }
+
+        private async Task EventDispatchLoopAsync()
+        {
+            await foreach (var (id, wireArgs) in _eventDispatch.Reader.ReadAllAsync().ConfigureAwait(false))
+            {
+                if (!_eventSubs.TryGetValue(id, out var sub)) continue; // yarışta çıkılmış abonelik
+                PluginEventArgs? e = null;
+                try
+                {
+                    var args = new object?[wireArgs.Length];
+                    for (int i = 0; i < wireArgs.Length; i++) args[i] = WireValueCodec.ToObject(wireArgs[i]);
+                    e = new PluginEventArgs(sub.EventName, args);
+                    sub.Handler(e);
+                }
+                catch (Exception ex)
+                {
+                    var handlerFailed = EventHandlerFailed;
+                    if (handlerFailed != null) { try { handlerFailed(e ?? new PluginEventArgs(sub.EventName, Array.Empty<object?>()), ex); } catch { } }
+                    else System.Diagnostics.Trace.TraceError($"[PluginWorkerHandle] '{sub.EventName}' handler hatası: {ex}");
+                }
+            }
         }
 
         private void EnsureAlive()
@@ -565,11 +738,45 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 return; // zaten dead işaretlenmiş - idempotent
 
             _pendingResolve?.TrySetException(reason);
+            foreach (var kvp in _pendingBatch)
+            {
+                if (_pendingBatch.TryRemove(kvp.Key, out var btcs))
+                    btcs.TrySetException(reason);
+            }
             foreach (var kvp in _pending)
             {
                 if (_pending.TryRemove(kvp.Key, out var tcs))
                     tcs.TrySetException(reason);
             }
+        }
+
+        private Exception? _pendingCrashReason;
+
+        /// <summary>
+        /// Worker çöktü / kilitlendi (heartbeat) / beklenmedik şekilde kapandı. NotifyOnCrash'ten BAĞIMSIZ her
+        /// zaman tetiklenir - uygulama bunu UI bildirimi, e-posta, merkezi log vb.'ye bağlar (crash log dosyası
+        /// NotifyOnCrash açıksa yine yazılır). Handler thread-pool'da çağrılır, worker'ı/restart'ı bloklamaz.
+        /// Restart denemesi de başarısız olursa bir kez daha (WillRestart=false) tetiklenir.
+        /// </summary>
+        public event EventHandler<PluginWorkerCrashedEventArgs>? Crashed;
+
+        /// <summary>AutoRestartOnCrash ile worker başarıyla yeniden başlatıldı (yeni nesil, yeni process).</summary>
+        public event EventHandler<PluginWorkerRestartedEventArgs>? Restarted;
+
+        private void RaiseCrashed(Exception reason, bool willRestart)
+        {
+            var handler = Crashed;
+            if (handler == null) return;
+            var e = new PluginWorkerCrashedEventArgs(PluginFilePath, TypeFullName, reason, Generation, willRestart);
+            _ = Task.Run(() => { try { handler(this, e); } catch { /* bildirim handler'ı worker'ı etkilememeli */ } });
+        }
+
+        private void RaiseRestarted()
+        {
+            var handler = Restarted;
+            if (handler == null) return;
+            var e = new PluginWorkerRestartedEventArgs(PluginFilePath, TypeFullName, Generation, ProcessId);
+            _ = Task.Run(() => { try { handler(this, e); } catch { } });
         }
 
         private void LogCrash(Exception ex)
@@ -642,6 +849,8 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         {
             if (_disposed) return;
             _disposed = true;
+            _eventSubs.Clear();
+            _eventDispatch.Writer.TryComplete();
 
             if (_process != null && !_promoted)
                 await ShutdownInternalAsync(graceful: true).ConfigureAwait(false);

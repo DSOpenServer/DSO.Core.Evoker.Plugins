@@ -13,6 +13,9 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         public string MethodName { get; }
         public string? RemoteExceptionType { get; }
 
+        /// <summary>Toplu çağrıda (InvokeBatchAsync) hata veren çağrının sırası; öncekiler çalıştı, sonrakiler çalışmadı. Tekil çağrıda null.</summary>
+        public int? BatchIndex { get; init; }
+
         public PluginInvocationException(string methodName, string? remoteExceptionType, string? remoteMessage, Exception? inner = null)
             : base($"[Plugin] '{methodName}' çağrısı plugin içinde hata verdi: {remoteExceptionType}: {remoteMessage}", inner)
         {
@@ -25,13 +28,13 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// hataları (MissingMethodException / MissingMemberException - yanlış isim, uygun overload yok)
         /// çağıran hatasıdır ve olduğu gibi fırlatılır; geri kalan her şey PluginInvocationException.
         /// </summary>
-        public static Exception FromRemote(string name, string? remoteExceptionType, string? remoteMessage)
+        public static Exception FromRemote(string name, string? remoteExceptionType, string? remoteMessage, int? batchIndex = null)
         {
             if (remoteExceptionType == typeof(MissingMethodException).FullName || remoteExceptionType == nameof(MissingMethodException))
                 return new MissingMethodException(remoteMessage);
             if (remoteExceptionType == typeof(MissingMemberException).FullName || remoteExceptionType == nameof(MissingMemberException))
                 return new MissingMemberException(remoteMessage);
-            return new PluginInvocationException(name, remoteExceptionType, remoteMessage);
+            return new PluginInvocationException(name, remoteExceptionType, remoteMessage) { BatchIndex = batchIndex };
         }
     }
 

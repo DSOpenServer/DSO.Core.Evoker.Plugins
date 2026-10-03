@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -48,6 +49,25 @@ namespace DSO.Core.Evoker.Plugins.Loading
         public object? Invoke(string methodName, params object?[] args) => Sync(InvokeAsync(methodName, args));
         public T? Invoke<T>(string methodName, params object?[] args) => Sync(InvokeAsync<T>(methodName, args));
         public void Execute(string methodName, params object?[] args) => Sync(ExecuteAsync(methodName, args));
+
+        // --- Toplu çağrı (in-process'te IPC yok - sadece sıralı döngü, aynı hata sözleşmesiyle) ---
+
+        public async Task<T?[]> InvokeBatchAsync<T>(string methodName, IReadOnlyList<object?[]> argsList)
+        {
+            if (argsList == null) throw new ArgumentNullException(nameof(argsList));
+            var results = new T?[argsList.Count];
+            for (int i = 0; i < argsList.Count; i++)
+            {
+                try { results[i] = await InvokeAsync<T>(methodName, argsList[i] ?? Array.Empty<object?>()).ConfigureAwait(false); }
+                catch (PluginInvocationException ex) when (ex.BatchIndex == null)
+                {
+                    throw new PluginInvocationException(methodName, ex.RemoteExceptionType, ex.InnerException?.Message ?? ex.Message, ex.InnerException) { BatchIndex = i };
+                }
+            }
+            return results;
+        }
+
+        public Task ExecuteBatchAsync(string methodName, IReadOnlyList<object?[]> argsList) => InvokeBatchAsync<object>(methodName, argsList);
 
         // --- Property / field (doğrudan DynamicEntityAccessor - sıcak yol) ---
 
@@ -112,6 +132,40 @@ namespace DSO.Core.Evoker.Plugins.Loading
         public Func<object?[], Task> GetActionAsync(string methodName, object?[]? sampleArgs = null)
             => args => ExecuteAsync(methodName, args);
 
+        // --- Event'ler ---
+
+        public IDisposable Subscribe(string eventName, Action<PluginEventArgs> handler)
+        {
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            var instance = Builder.Instance;
+            try
+            {
+                return Builder.AddEventHandler(eventName, raw =>
+                {
+                    // Sandbox ile aynı: plugin'in kendisi (sender) null; handler hatası plugin'e yansımaz.
+                    var args = new object?[raw.Length];
+                    for (int i = 0; i < raw.Length; i++) args[i] = ReferenceEquals(raw[i], instance) ? null : raw[i];
+                    var e = new PluginEventArgs(eventName, args);
+                    try { handler(e); }
+                    catch (Exception ex)
+                    {
+                        var failed = EventHandlerFailed;
+                        if (failed != null) { try { failed(e, ex); } catch { } }
+                        else System.Diagnostics.Trace.TraceError($"[InProcessPluginBuilder] '{eventName}' handler hatası: {ex}");
+                    }
+                });
+            }
+            catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(eventName, ex); }
+        }
+
+        public Task<IDisposable> SubscribeAsync(string eventName, Action<PluginEventArgs> handler)
+            => Task.FromResult(Subscribe(eventName, handler));
+
+        public string[] GetEventNames() => Builder.GetEventNames();
+
+        /// <summary>Bkz. PluginWorkerHandle.EventHandlerFailed - aynı sözleşme.</summary>
+        public event Action<PluginEventArgs, Exception>? EventHandlerFailed;
+
         // --- Cache ---
 
         public void ForgetCache() => Builder.ForgetCache();
@@ -124,28 +178,22 @@ namespace DSO.Core.Evoker.Plugins.Loading
 
         // --- yardımcılar ---
 
-        private bool ReturnsTask(string methodName, object?[]? sampleArgs)
-        {
-            int argCount = sampleArgs?.Length ?? -1;
-            var candidates = Builder.Type.GetMethods(Flags).Where(m => m.Name == methodName).ToList();
-            if (candidates.Count == 0)
-                throw new MissingMethodException($"'{Builder.Type.FullName}' üzerinde '{methodName}' metodu bulunamadı.");
-            var m = candidates.FirstOrDefault(c => c.GetParameters().Length == argCount) ?? candidates[0];
-            return typeof(Task).IsAssignableFrom(m.ReturnType);
-        }
+        // Metot seçimi Invoke ile AYNI kural (EvokerBuilder.FindMethod: optional parametre, büyük/küçük harf, tip).
+        private bool ReturnsTask(string methodName, object?[]? sampleArgs) =>
+            typeof(Task).IsAssignableFrom(Builder.FindMethod(methodName, sampleArgs).ReturnType);
 
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Type> _memberTypes = new();
         private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, int), ParameterInfo[]?> _uniqueSignatures = new();
-
-        private BindingFlags Flags => BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static
-            | (IncludeNonPublic ? BindingFlags.NonPublic : 0);
 
         private Type MemberType(string memberName) => _memberTypes.GetOrAdd(memberName, name =>
         {
             var flags = BindingFlags.Instance | BindingFlags.DeclaredOnly | BindingFlags.Public
                 | (IncludeNonPublic ? BindingFlags.NonPublic : 0);
+            // DynamicEntityAccessor ile aynı: birebir isim, yoksa TEK büyük/küçük harf duyarsız eşleşme (VB.NET).
             return Builder.Type.GetProperty(name, flags)?.PropertyType
                 ?? Builder.Type.GetField(name, flags)?.FieldType
+                ?? SingleIgnoreCase(Builder.Type.GetProperties(flags), name)?.PropertyType
+                ?? SingleIgnoreCase(Builder.Type.GetFields(flags), name)?.FieldType
                 ?? throw new MissingMemberException(Builder.Type.Name, name);
         });
 
@@ -166,7 +214,7 @@ namespace DSO.Core.Evoker.Plugins.Loading
         {
             var ps = _uniqueSignatures.GetOrAdd((methodName, args.Length), key =>
             {
-                var c = Builder.Type.GetMethods(Flags).Where(m => m.Name == key.Item1 && m.GetParameters().Length == key.Item2).ToList();
+                var c = Builder.FindMethodCandidates(key.Item1, key.Item2);
                 return c.Count == 1 ? c[0].GetParameters() : null;
             });
             if (ps == null) return args;
@@ -184,6 +232,12 @@ namespace DSO.Core.Evoker.Plugins.Loading
                 copy[i] = WireValueCodec.ConvertTo(a, pt);
             }
             return copy ?? args;
+        }
+
+        private static T? SingleIgnoreCase<T>(T[] members, string name) where T : MemberInfo
+        {
+            var m = members.Where(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase)).ToList();
+            return m.Count == 1 ? m[0] : null;
         }
 
         private static object[]? ToObjArray(object?[]? args) => args == null ? null : args.Select(a => a!).ToArray();

@@ -13,94 +13,84 @@ namespace DSO.Core.Evoker.Plugins.Loading
     /// kullanıcılarını ilgilendirmez, bu yüzden DSO.Core.Evoker'ın kendisine değil, buraya
     /// (DSO.Core.Evoker.Plugins) bir extension olarak konuldu.
     ///
-    /// Loader'ın (ManagedDotNetPluginLoader) görevi SADECE güvenli yükleme - yükleme bitince
-    /// topu tamamen buraya, EvokerBuilder'a bağlı bu extension'a bırakıyor.
+    /// Metot SEÇİMİ artık EvokerBuilder.FindMethod ile yapılıyor (önceden burada ayrı, sadece parametre
+    /// sayısına bakan bir kopya vardı) - böylece optional parametreler (VB.NET), büyük/küçük harf
+    /// duyarsızlığı ve argüman tipine göre overload seçimi Invoke ile BİREBİR aynı kuralla işliyor.
     /// </summary>
     public static class EvokerBuilderDynamicInvokeExtensions
     {
-        // EvokerBuilder.Type'a göre (instance'a göre DEĞİL) cache'leniyor - tıpkı EvokerBuilder'ın
-        // kendi statik Cache'inin Type kimliğine göre tutulması gibi. Aynı plugin tipinden birden
-        // fazla loader/instance varsa bu cache'i PAYLAŞIRLAR.
-        // IncludeNonPublic de key'e dahil: aynı Type için bir loader includeNonPublic:false, başka
-        // bir loader includeNonPublic:true ile oluşturulmuş olabilir - ikisi FARKLI görünürlükte metot
-        // arıyor, aynı cache girdisini PAYLAŞMAMALI (aksi halde ilk çözülen "şekil" ikincisine sızar).
-        private static readonly ConcurrentDictionary<(Type Type, string Method, int ArgCount, bool IncludeNonPublic), MethodInfo> ResolvedMethods = new();
+        // (Type, metot adı, argüman TİPLERİ imzası, NonPublic) -> çözülmüş metot. Aynı plugin tipinden birden
+        // fazla loader/instance varsa PAYLAŞILIR. Plugin unload'unda Forget ile temizlenmeli (bkz. ForgetType).
+        private static readonly ConcurrentDictionary<(Type Type, string Method, string ArgSig, bool NonPublic), MethodInfo> ResolvedMethods = new();
+
+        private static readonly MethodInfo InvokeAsyncOpenGeneric = typeof(EvokerBuilder)
+            .GetMethods()
+            .First(m => m.Name == nameof(EvokerBuilder.InvokeAsync) && m.IsGenericMethodDefinition);
+
+        private static readonly ConcurrentDictionary<Type, MethodInfo> ClosedInvokeAsync = new();
 
         /// <summary>
-        /// methodName'i çağırır; metodun void/Task/Task&lt;T&gt;/senkron olduğunu reflection ile
-        /// (bir kere, sonrası cache'ten) tespit edip EvokerBuilder'ın doğru üyesini kullanır.
+        /// methodName'i çağırır; metodun void/Task/Task&lt;T&gt;/senkron olduğunu (bir kere, sonrası cache'ten)
+        /// tespit edip EvokerBuilder'ın doğru üyesini kullanır.
         /// </summary>
         public static async Task<object?> InvokeDynamicAsync(this EvokerBuilder builder, string methodName, object?[] args)
         {
             if (builder == null) throw new ArgumentNullException(nameof(builder));
             if (string.IsNullOrWhiteSpace(methodName)) throw new ArgumentException("methodName boş olamaz.", nameof(methodName));
 
-            var objArgs = args ?? Array.Empty<object?>();
-            var callArgs = objArgs.Select(a => a!).ToArray(); // EvokerBuilder object[] bekliyor
+            var callArgs = (args ?? Array.Empty<object?>()).Select(a => a!).ToArray(); // EvokerBuilder object[] bekliyor
+            var methodInfo = ResolveMethod(builder, methodName, callArgs);
+            var returnType = methodInfo.ReturnType;
 
-            var methodInfo = ResolvedMethods.GetOrAdd(
-                (builder.Type, methodName, callArgs.Length, builder.IncludeNonPublic),
-                key => ResolveMethodForReturnType(key.Type, key.Method, key.ArgCount, key.IncludeNonPublic));
-
-            // void
-            if (methodInfo.ReturnType == typeof(void))
+            if (returnType == typeof(void))
             {
                 builder.Execute(methodName, callArgs);
                 return null;
             }
 
-            // Task (generic olmayan)
-            if (methodInfo.ReturnType == typeof(Task))
+            if (returnType == typeof(Task))
             {
                 await builder.ExecuteAsync(methodName, callArgs).ConfigureAwait(false);
                 return null;
             }
 
-            // Task<T> - T derleme zamanında bilinmiyor, reflection ile generic InvokeAsync<T>'ye bağlanıyoruz
-            if (methodInfo.ReturnType.IsGenericType &&
-                methodInfo.ReturnType.GetGenericTypeDefinition() == typeof(Task<>))
+            if (returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(Task<>))
             {
-                var resultType = methodInfo.ReturnType.GetGenericArguments()[0];
-                var invokeAsyncOpenGeneric = typeof(EvokerBuilder)
-                    .GetMethods()
-                    .First(m => m.Name == nameof(EvokerBuilder.InvokeAsync) && m.IsGenericMethodDefinition);
-                var invokeAsyncClosed = invokeAsyncOpenGeneric.MakeGenericMethod(resultType);
-
-                var taskObj = (Task)invokeAsyncClosed.Invoke(builder, new object[] { methodName, callArgs })!;
+                var resultType = returnType.GetGenericArguments()[0];
+                var closed = ClosedInvokeAsync.GetOrAdd(resultType, t => InvokeAsyncOpenGeneric.MakeGenericMethod(t));
+                var taskObj = (Task)closed.Invoke(builder, new object[] { methodName, callArgs })!;
                 await taskObj.ConfigureAwait(false);
-
-                var resultProperty = taskObj.GetType().GetProperty(nameof(Task<object>.Result))!;
-                return resultProperty.GetValue(taskObj);
+                return taskObj.GetType().GetProperty(nameof(Task<object>.Result))!.GetValue(taskObj);
             }
 
-            // düz senkron dönüş değeri
             return builder.Invoke(methodName, callArgs);
         }
 
-        /// <summary>
-        /// Sadece ReturnType'ı öğrenmek için basit bir overload seçimi (isim + parametre SAYISI).
-        /// EvokerBuilder.GetMethodInfo private olduğu için burada aynı basit stratejiyi tekrar
-        /// ediyoruz - amaç tam overload çözümü değil, hangi "şekil" ile karşı karşıya olduğumuzu
-        /// belirlemek. includeNonPublic, builder'ın kendi ayarıyla (builder.IncludeNonPublic) BİREBİR
-        /// aynı olmalı - aksi halde burada görünmeyen (private) bir metot, EvokerBuilder.Invoke/Execute
-        /// tarafında GetMethodInfo'nun kendi flags'iyle bulunabilir ama "şekli" burada hiç tespit
-        /// edilemediği için InvokeDynamicAsync baştan MissingMethodException ile patlardı. NOT (bilinen
-        /// sınırlama): overload seçimi argüman SAYISINA göre - VB'nin Optional parametreleriyle
-        /// (sağlanan argüman sayısı &lt; parametre sayısı) ilgili EvokerBuilder.GetMethodInfo'daki
-        /// bilinen açık burada da geçerli.
-        /// </summary>
-        private static MethodInfo ResolveMethodForReturnType(Type type, string methodName, int argCount, bool includeNonPublic)
+        /// <summary>InvokeDynamicAsync'in çağıracağı metodu (aynı kuralla) döner - dönüş şeklini önceden bilmek isteyenler için.</summary>
+        public static MethodInfo ResolveMethod(this EvokerBuilder builder, string methodName, object?[] args)
         {
-            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
-            if (includeNonPublic) flags |= BindingFlags.NonPublic;
+            string sig = string.Join(",", args.Select(a => a?.GetType().FullName ?? "null"));
+            return ResolvedMethods.GetOrAdd((builder.Type, methodName, sig, builder.IncludeNonPublic),
+                _ => builder.FindMethod(methodName, args));
+        }
 
-            var candidates = type.GetMethods(flags).Where(m => m.Name == methodName).ToList();
+        /// <summary>
+        /// Bu assembly'nin tiplerine (generic argüman olarak bile - ör. Task&lt;List&lt;Point&gt;&gt;) dokunan tüm
+        /// cache girdilerini bırakır. Plugin'in AssemblyLoadContext'i unload edilmeden önce ŞART.
+        /// </summary>
+        public static void ForgetAssembly(Assembly assembly)
+        {
+            foreach (var key in ResolvedMethods.Keys)
+                if (TypeInvolves(key.Type, assembly)) ResolvedMethods.TryRemove(key, out _);
+            foreach (var key in ClosedInvokeAsync.Keys)
+                if (TypeInvolves(key, assembly)) ClosedInvokeAsync.TryRemove(key, out _);
+        }
 
-            if (candidates.Count == 0)
-                throw new MissingMethodException($"'{type.FullName}' üzerinde '{methodName}' metodu bulunamadı.");
-
-            var byCount = candidates.FirstOrDefault(m => m.GetParameters().Length == argCount);
-            return byCount ?? candidates[0];
+        internal static bool TypeInvolves(Type t, Assembly a)
+        {
+            if (t.Assembly == a) return true;
+            if (t.HasElementType && TypeInvolves(t.GetElementType()!, a)) return true;
+            return t.IsGenericType && t.GetGenericArguments().Any(g => TypeInvolves(g, a));
         }
     }
 }

@@ -166,7 +166,7 @@ namespace DSO.Core.Evoker.Plugins.Scanning
 
             foreach (var type in result.Types)
             {
-                yield return $"  TİP: {type.FullName} ({type.Methods.Count} metot)";
+                yield return $"  TİP: {type.FullName} ({type.Methods.Count} metot, {type.Properties.Count} property, {type.Fields.Count} field, {type.Events.Count} event)";
                 foreach (var method in type.Methods)
                 {
                     var stat = method.IsStatic ? "static " : "";
@@ -174,6 +174,15 @@ namespace DSO.Core.Evoker.Plugins.Scanning
                         $"{p.TypeName} {p.Name}" + (p.IsOptional ? " = ?" : "") + (p.IsByRef ? " (ref/out)" : "")));
                     yield return $"    {stat}{method.ReturnTypeName} {method.Name}({parms})";
                 }
+                foreach (var p in type.Properties)
+                {
+                    var acc = (p.CanRead ? "get; " : "") + (p.CanWrite ? "set; " : "");
+                    yield return $"    {(p.IsStatic ? "static " : "")}property {p.TypeName} {p.Name} {{ {acc}}}";
+                }
+                foreach (var f in type.Fields)
+                    yield return $"    {(f.IsStatic ? "static " : "")}field {f.TypeName} {f.Name}{(f.CanWrite ? "" : " (readonly)")}";
+                foreach (var e in type.Events)
+                    yield return $"    {(e.IsStatic ? "static " : "")}event {e.Name}({string.Join(", ", e.ArgumentTypeNames)})";
             }
 
             foreach (var error in result.Errors)
@@ -224,7 +233,92 @@ namespace DSO.Core.Evoker.Plugins.Scanning
                 }
             }
 
-            return new PluginTypeInfo { FullName = type.FullName ?? type.Name, Methods = methods };
+            var properties = new List<PluginMemberInfo>();
+            var fields = new List<PluginMemberInfo>();
+            var events = new List<PluginEventInfo>();
+
+            // Sadece PUBLIC yüzey (tarama admin'e "dışarı açılan" API'yi gösterir; includeNonPublic
+            // çalışma zamanında verilen bir karar - private üyeler bilerek listelenmiyor).
+            TryScan(type, errors, "property", () =>
+            {
+                foreach (var p in type.GetProperties(flags))
+                {
+                    if (p.GetIndexParameters().Length > 0) continue; // indexer - GetValue/SetValue ile erişilemez
+                    var getter = p.GetGetMethod();
+                    var setter = p.GetSetMethod();
+                    properties.Add(new PluginMemberInfo
+                    {
+                        Name = p.Name,
+                        TypeName = p.PropertyType.FullName ?? p.PropertyType.Name,
+                        IsField = false,
+                        CanRead = getter != null,
+                        CanWrite = setter != null,
+                        IsPublic = true,
+                        IsStatic = (getter ?? setter)?.IsStatic ?? false
+                    });
+                }
+            });
+
+            TryScan(type, errors, "field", () =>
+            {
+                foreach (var f in type.GetFields(flags))
+                {
+                    if (f.IsSpecialName) continue;
+                    fields.Add(new PluginMemberInfo
+                    {
+                        Name = f.Name,
+                        TypeName = f.FieldType.FullName ?? f.FieldType.Name,
+                        IsField = true,
+                        CanRead = true,
+                        CanWrite = !f.IsInitOnly && !f.IsLiteral,
+                        IsPublic = f.IsPublic,
+                        IsStatic = f.IsStatic
+                    });
+                }
+            });
+
+            TryScan(type, errors, "event", () =>
+            {
+                foreach (var e in type.GetEvents(flags))
+                {
+                    var handlerType = e.EventHandlerType;
+                    var invoke = handlerType?.GetMethod("Invoke");
+                    events.Add(new PluginEventInfo
+                    {
+                        Name = e.Name,
+                        HandlerTypeName = handlerType?.FullName ?? handlerType?.Name ?? "?",
+                        ArgumentTypeNames = invoke?.GetParameters().Select(p => p.ParameterType.FullName ?? p.ParameterType.Name).ToList()
+                                            ?? new List<string>(),
+                        IsPublic = true,
+                        IsStatic = e.GetAddMethod()?.IsStatic ?? false
+                    });
+                }
+            });
+
+            return new PluginTypeInfo
+            {
+                FullName = type.FullName ?? type.Name,
+                Methods = methods,
+                Properties = properties,
+                Fields = fields,
+                Events = events
+            };
+        }
+
+        // Tek bir üye grubu (ör. bir property'nin tipi bağımlılık eksikliğinden çözülemiyor) patlarsa
+        // tüm tipi DÜŞÜRMEDEN hatayı kaydet, diğer gruplara devam et - metot taramasıyla aynı felsefe.
+        private static void TryScan(Type type, List<PluginScanError> errors, string what, Action scan)
+        {
+            try { scan(); }
+            catch (Exception ex)
+            {
+                errors.Add(new PluginScanError
+                {
+                    TypeName = type.FullName,
+                    Message = $"{what} listesi okunamadı: {ex.Message}",
+                    ExceptionType = ex.GetType().Name
+                });
+            }
         }
 
         /// <summary>

@@ -9,12 +9,15 @@
   <ItemGroup>
     <Compile Remove="DSO.Core.Evoker.PluginHost\**" />
     <Compile Remove="DSO.Core.Evoker.Plugins.TestApi\**" />
+    <Compile Remove="SampleDep\**" />
     <Compile Remove="SamplePlugin\**" />
     <EmbeddedResource Remove="DSO.Core.Evoker.PluginHost\**" />
     <EmbeddedResource Remove="DSO.Core.Evoker.Plugins.TestApi\**" />
+    <EmbeddedResource Remove="SampleDep\**" />
     <EmbeddedResource Remove="SamplePlugin\**" />
     <None Remove="DSO.Core.Evoker.PluginHost\**" />
     <None Remove="DSO.Core.Evoker.Plugins.TestApi\**" />
+    <None Remove="SampleDep\**" />
     <None Remove="SamplePlugin\**" />
   </ItemGroup>
 

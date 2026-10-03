@@ -35,4 +35,29 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         public string? ExceptionType { get; init; }
         public string? ExceptionMessage { get; init; }
     }
+
+    /// <summary>
+    /// Toplu çağrı: aynı MethodHandle, N farklı argüman seti - worker bunları SIRAYLA çalıştırır ve TEK cevapla
+    /// döner. Process sınırı geçme maliyeti (context switch + pipe I/O) N çağrıya bölünür.
+    /// </summary>
+    public sealed class InvokeBatchRequest
+    {
+        public long CorrelationId { get; init; }
+        public int MethodHandle { get; init; }
+        public WireValue[][] ArgsList { get; init; } = System.Array.Empty<WireValue[]>();
+    }
+
+    public sealed class InvokeBatchReply
+    {
+        public long CorrelationId { get; init; }
+        public bool Success { get; init; }
+
+        /// <summary>Success ise: her çağrının sonucu, sırasıyla.</summary>
+        public WireValue[] Results { get; init; } = System.Array.Empty<WireValue>();
+
+        /// <summary>Success değilse: hata veren çağrının sırası (ondan SONRAKİLER çalıştırılmadı, öncekiler çalıştı).</summary>
+        public int FailedIndex { get; init; } = -1;
+        public string? ExceptionType { get; init; }
+        public string? ExceptionMessage { get; init; }
+    }
 }

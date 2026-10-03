@@ -7,14 +7,30 @@
   "targets": {
     ".NETCoreApp,Version=v6.0": {
       "SamplePlugin/1.0.0": {
+        "dependencies": {
+          "SampleDep": "1.0.0"
+        },
         "runtime": {
           "SamplePlugin.dll": {}
+        }
+      },
+      "SampleDep/1.0.0": {
+        "runtime": {
+          "SampleDep.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
         }
       }
     }
   },
   "libraries": {
     "SamplePlugin/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "SampleDep/1.0.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

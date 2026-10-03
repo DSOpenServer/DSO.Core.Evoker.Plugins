@@ -1,4 +1,5 @@
-﻿using DSO.Core.Evoker.Plugins.Loading;
+﻿using DSO.Core.Evoker.Plugins;
+using DSO.Core.Evoker.Plugins.Loading;
 using DSO.Core.Evoker.Plugins.Sandbox;
 using DSO.Core.Evoker.Plugins.Scanning;
 using System.Diagnostics;
@@ -10,11 +11,11 @@ namespace DSO.Core.Evoker.Plugins.TestApi
     {
         static string PluginsFolderPath = Path.Combine(AppContext.BaseDirectory, "Plugins");
         static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
+        static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
+        static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
 
         public static void Test1()
         {
-            string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll");
-
             Console.WriteLine("=== TODO 1: DetectKind ===");
             var kind = PluginScanner.DetectKind(dllPath);
             Console.WriteLine($"Kind: {kind}");
@@ -196,8 +197,6 @@ namespace DSO.Core.Evoker.Plugins.TestApi
 
         public static async Task Test2Sandbox()
         {
-            string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
-            string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
             string typeFullName = "TestPlugin.SamplePlugin";
             string tmpCrashLog = Path.Combine(Path.GetTempPath(), "sandbox-smoketest-crashes.log");
             if (File.Exists(tmpCrashLog)) File.Delete(tmpCrashLog);
@@ -565,8 +564,357 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             // NOT: Bu proje SamplePlugin'e derleme zamanı referans VERMİYOR - host plugin tiplerini (Point, Level)
             // bilmiyor; kendi PointDto'sunu ve int'i kullanıyor (gerçek senaryo).
 
-            string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
-            string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+            const string TypeName = "TestPlugin.SamplePlugin";
+
+            if (!PreflightSamplePlugin(dllPath))
+            {
+                Console.WriteLine(2);
+                return;
+            }
+
+            int failures = 0;
+            void Check(string label, bool ok, string detail = "")
+            {
+                Console.WriteLine($"  [{(ok ? "OK" : "HATA")}] {label}{(detail.Length > 0 ? "  -> " + detail : "")}");
+                if (!ok) failures++;
+            }
+
+            async Task ExpectAsync<TEx>(string label, Func<Task> action, Func<TEx, bool>? extra = null) where TEx : Exception
+            {
+                try
+                {
+                    await action();
+                    Check(label, false, "exception bekleniyordu, gelmedi");
+                }
+                catch (TEx ex)
+                {
+                    Check(label, extra == null || extra(ex), $"{ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+                }
+                catch (Exception ex)
+                {
+                    Check(label, false, $"beklenen {typeof(TEx).Name}, gelen {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+                }
+            }
+
+            PluginWorkerOptions Options(bool autoRestart = false) => new()
+            {
+                HostPath = hostDllPath,
+                MaxConcurrency = 1,
+                HeartbeatIntervalMs = 1000,
+                AutoRestartOnCrash = autoRestart,
+                NotifyOnCrash = false
+            };
+
+            async Task RunScenarioAsync(IPluginBuilder b)
+            {
+                try { await RunScenarioCoreAsync(b); }
+                catch (Exception ex)
+                {
+                    // Bir kontrolün içindeki çağrı beklenmedik bir exception fırlatırsa test programı KAPANMASIN:
+                    // bu modun kalan kontrolleri atlanır, hata raporlanır, diğer modlara devam edilir.
+                    Check($"senaryo beklenmedik bir hatayla KESİLDİ ({(b.IsSandboxed ? "sandbox" : "in-process")})", false, $"{ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            async Task RunScenarioCoreAsync(IPluginBuilder b)
+            {
+                Console.WriteLine($"\n===== {(b.IsSandboxed ? "SANDBOX" : "IN-PROCESS")} (IncludeNonPublic={b.IncludeNonPublic}) =====");
+
+                Console.WriteLine("-- Metot çağırma (sync/async, void/değer/Task/Task<T>) --");
+                Check("Invoke<int> Add(3,4)=7", b.Invoke<int>("Add", 3, 4) == 7);
+                Check("Invoke (object) Add(1,1)=2", Equals(b.Invoke("Add", 1, 1), 2));
+                Check("InvokeAsync<int> AddAsync(10,20)=30", await b.InvokeAsync<int>("AddAsync", 10, 20) == 30);
+                Check("Invoke<int> SENKRON ama Task<int> metot: AddAsync(1,2)=3", b.Invoke<int>("AddAsync", 1, 2) == 3);
+                b.Execute("DoSomething", 42);
+                Check("Execute DoSomething(42) -> field LastVoidCallValue=42", b.GetValue<int>("LastVoidCallValue") == 42);
+                await b.ExecuteAsync("DoAsyncWork", 5);
+                Check("ExecuteAsync DoAsyncWork(5) -> field=50 (Task beklendi)", await b.GetValueAsync<int>("LastVoidCallValue") == 50);
+                Check("Invoke<long> (int dönen metot, genişletme) Add(2,2)=4L", b.Invoke<long>("Add", 2, 2) == 4L);
+                Check("Invoke<string> Greet", b.Invoke<string>("Greet", "Ali", "Selam") == "Selam, Ali!");
+                Check("static metot StaticTwice(21)=42", b.Invoke<int>("StaticTwice", 21) == 42);
+                Check("overload Combine(int,int)=12", b.Invoke<int>("Combine", 1, 2) == 12);
+                Check("overload Combine(string,string)=\"a+b\"", b.Invoke<string>("Combine", "a", "b") == "a+b");
+                int c1 = b.Invoke<int>("Increment"), c2 = b.Invoke<int>("Increment");
+                Check("state korunuyor: Increment iki kez -> 1,2", c1 == 1 && c2 == 2, $"{c1},{c2}");
+
+                Console.WriteLine("-- Property / field --");
+                Check("GetValue<string> DisplayName = default", b.GetValue<string>("DisplayName") == "default");
+                b.SetValue("DisplayName", "yeni ad");
+                Check("SetValue + GetValue DisplayName", b.GetValue<string>("DisplayName") == "yeni ad");
+                await b.SetValueAsync("Counter", 100);
+                Check("SetValueAsync field Counter=100, sonra Increment=101", b.Invoke<int>("Increment") == 101);
+                Check("readonly field okunuyor ReadOnlyValue=10", b.GetValue<int>("ReadOnlyValue") == 10);
+                await ExpectAsync<MissingMemberException>("readonly field'a yazma -> MissingMember/MethodException",
+                    () => b.SetValueAsync("ReadOnlyValue", 1));
+
+                Console.WriteLine("-- Enum (host plugin'in enum tipini bilmiyor, int kullanıyor) --");
+                Check("GetValue<int> CurrentLevel = 1 (Low)", b.GetValue<int>("CurrentLevel") == 1);
+                b.SetValue("CurrentLevel", 3);
+                Check("SetValue(int 3) -> CurrentLevel = 3 (High)", b.GetValue<int>("CurrentLevel") == 3);
+                Check("enum parametre+dönüş: NextLevel(1)=2", b.Invoke<int>("NextLevel", 1) == 2);
+
+                Console.WriteLine("-- Complex (host kendi PointDto'sunu kullanıyor) --");
+                var loc = b.GetValue<PointDto>("Location");
+                Check("GetValue<PointDto> Location = (1,1)", loc is { X: 1, Y: 1 }, $"{loc?.X},{loc?.Y}");
+                b.SetValue("Location", new PointDto { X = 5, Y = 6 });
+                var loc2 = b.GetValue<PointDto>("Location");
+                Check("SetValue(PointDto) -> Location = (5,6)", loc2 is { X: 5, Y: 6 }, $"{loc2?.X},{loc2?.Y}");
+                var locJson = b.GetValue<JsonElement>("Location");
+                Check("GetValue<JsonElement> Location.X = 5", locJson.GetProperty("X").GetInt32() == 5);
+                Check("Complex ARGÜMAN: SumPoint(PointDto{2,3}) = 5", b.Invoke<int>("SumPoint", new PointDto { X = 2, Y = 3 }) == 5);
+                var mp = b.Invoke<PointDto>("MakePoint", 7, 9);
+                Check("Complex DÖNÜŞ: Invoke<PointDto> MakePoint(7,9)", mp is { X: 7, Y: 9 });
+
+                Console.WriteLine("-- private üyeler --");
+                if (b.IncludeNonPublic)
+                {
+                    Check("private field _secretCounter = 5", b.GetValue<int>("_secretCounter") == 5);
+                    b.SetValue("_secretCounter", 99);
+                    Check("private field SetValue -> 99", b.GetValue<int>("_secretCounter") == 99);
+                    Check("private property SecretName = hidden", b.GetValue<string>("SecretName") == "hidden");
+                    Check("private metot MultiplySecret(6,7)=42", b.Invoke<int>("MultiplySecret", 6, 7) == 42);
+                }
+                else
+                {
+                    await ExpectAsync<MissingMemberException>("private field görünmüyor", () => b.GetValueAsync<int>("_secretCounter"));
+                    await ExpectAsync<MissingMethodException>("private metot görünmüyor", () => b.InvokeAsync<int>("MultiplySecret", 6, 7));
+                }
+
+                Console.WriteLine("-- GetFunc / GetAction (bir kez çözülür, çok kez çağrılır) --");
+                var add = b.GetFunc<int>("Add", new object?[] { 0, 0 });
+                long sum = 0;
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < 2000; i++) sum += add(new object?[] { i, 1 });
+                Check("GetFunc<int> Add x2000", sum == Enumerable.Range(0, 2000).Sum(i => (long)i + 1), $"{sw.ElapsedMilliseconds}ms");
+                var addAsync = b.GetFuncAsync<int>("AddAsync", new object?[] { 0, 0 });
+                Check("GetFuncAsync<int> AddAsync(4,5)=9", await addAsync(new object?[] { 4, 5 }) == 9);
+                var getFuncTask = b.GetFunc<int>("AddAsync", new object?[] { 0, 0 });
+                Check("GetFunc<int> Task<int> dönen metot (senkron beklenir)=11", getFuncTask(new object?[] { 5, 6 }) == 11);
+                var doSomething = b.GetAction("DoSomething", new object?[] { 0 });
+                doSomething(new object?[] { 7 });
+                Check("GetAction DoSomething(7) -> field=7", b.GetValue<int>("LastVoidCallValue") == 7);
+                var doAsyncAction = b.GetAction("DoAsyncWork", new object?[] { 0 });
+                doAsyncAction(new object?[] { 3 });
+                Check("GetAction Task dönen metot BEKLENİYOR (fire-and-forget değil) -> field=30", b.GetValue<int>("LastVoidCallValue") == 30);
+                var doAsyncFn = b.GetActionAsync("DoAsyncWork", new object?[] { 0 });
+                await doAsyncFn(new object?[] { 4 });
+                Check("GetActionAsync DoAsyncWork(4) -> field=40", b.GetValue<int>("LastVoidCallValue") == 40);
+
+                Console.WriteLine("-- Hatalar (iki modda AYNI exception tipleri) --");
+                await ExpectAsync<PluginInvocationException>("plugin exception -> PluginInvocationException",
+                    () => b.InvokeAsync("Throws"), ex => ex.RemoteExceptionType == typeof(InvalidOperationException).FullName);
+                await ExpectAsync<MissingMethodException>("olmayan metot -> MissingMethodException", () => b.InvokeAsync("YokBoyleMetot"));
+                await ExpectAsync<MissingMemberException>("olmayan üye -> MissingMemberException", () => b.GetValueAsync<int>("YokBoyleUye"));
+                Check("hatalardan sonra instance hâlâ çalışıyor", b.Invoke<int>("Add", 1, 2) == 3);
+
+                Console.WriteLine("-- Timeout (sadece bekleme kesilir) --");
+                b.DefaultTimeoutMs = 150;
+                await ExpectAsync<TimeoutException>("DefaultTimeoutMs=150, SlowAsync(1000) -> TimeoutException", () => b.InvokeAsync("SlowAsync", 1000));
+                b.DefaultTimeoutMs = null;
+                Check("timeout sonrası çalışmaya devam", b.Invoke<int>("Add", 2, 2) == 4);
+
+                Console.WriteLine("-- Optional parametre + büyük/küçük harf (VB.NET) --");
+                Check("Greet(\"Ali\") - optional greeting varsayılanı", b.Invoke<string>("Greet", "Ali") == "Merhaba, Ali!");
+                Check("optionaldemo(1) küçük harf + 2 optional", b.Invoke<string>("optionaldemo", 1) == "1|5|x");
+                Check("OptionalDemo(1,2)", b.Invoke<string>("OptionalDemo", 1, 2) == "1|2|x");
+                Check("property küçük harf: displayname", b.GetValue<string>("displayname") == "yeni ad");
+                Check("GetFunc optional ile: sampleArgs 1 eleman", b.GetFunc<string>("OptionalDemo", new object?[] { 0 })(new object?[] { 7 }) == "7|5|x");
+
+                Console.WriteLine("-- Event'ler --");
+                var names = b.GetEventNames();
+                Check("GetEventNames", new[] { "CounterChanged", "PointMoved", "Progress" }.All(names.Contains), string.Join(",", names));
+                var counterValues = new System.Collections.Concurrent.ConcurrentQueue<int>();
+                object? senderSeen = "set edilmedi";
+                var counterSub = b.Subscribe("CounterChanged", e => { senderSeen = e[0]; counterValues.Enqueue(e.Get<int>(1)); });
+                int before = b.Invoke<int>("Increment");
+                int after = b.Invoke<int>("Increment");
+                await WaitUntil(() => counterValues.Count >= 2);
+                Check("EventHandler<int>: iki Increment -> iki event, doğru değerler", counterValues.SequenceEqual(new[] { before, after }), string.Join(",", counterValues));
+                Check("sender (plugin'in kendisi) null geliyor", senderSeen == null);
+                counterSub.Dispose();
+                await Task.Delay(100);
+                b.Invoke<int>("Increment");
+                await Task.Delay(200);
+                Check("Dispose sonrası event gelmiyor", counterValues.Count == 2, counterValues.Count.ToString());
+
+                var progress = new System.Collections.Concurrent.ConcurrentQueue<int>();
+                using (await b.SubscribeAsync("progress", e => progress.Enqueue(e.Get<int>(1))))   // küçük harf isim
+                {
+                    b.Invoke<int>("RunWithProgress", 200);
+                    await WaitUntil(() => progress.Count >= 200);
+                }
+                Check("Action<string,int> event, 200 bildirim, SIRA korunuyor", progress.SequenceEqual(Enumerable.Range(1, 200)), progress.Count.ToString());
+
+                PointDto? moved = null;
+                using (b.Subscribe("PointMoved", e => moved = e.Get<PointDto>(1)))
+                {
+                    b.Execute("MoveTo", 11, 12);
+                    await WaitUntil(() => moved != null);
+                }
+                Check("Complex event argümanı -> host DTO'su: PointMoved(11,12)", moved is { X: 11, Y: 12 }, $"{moved?.X},{moved?.Y}");
+
+                int okAfterThrow = 0;
+                using (b.Subscribe("CounterChanged", e => { okAfterThrow++; throw new Exception("handler hatası (kasıtlı)"); }))
+                {
+                    int c = b.Invoke<int>("Increment");
+                    await WaitUntil(() => okAfterThrow >= 1);
+                    Check("handler exception fırlatsa da plugin çağrısı başarılı döndü", c > 0);
+                }
+                Check("handler hatasından sonra plugin çalışıyor", b.Invoke<int>("Add", 1, 1) == 2);
+                await ExpectAsync<MissingMemberException>("olmayan event -> MissingMemberException", () => b.SubscribeAsync("YokBoyleEvent", _ => { }));
+
+                Console.WriteLine("-- Toplu çağrı (InvokeBatchAsync) --");
+                var batchArgs = Enumerable.Range(0, 5000).Select(i => new object?[] { i, 1 }).ToList();
+                var swb = Stopwatch.StartNew();
+                var batch = await b.InvokeBatchAsync<int>("Add", batchArgs);
+                long batchMs = swb.ElapsedMilliseconds;
+                Check("InvokeBatchAsync Add x5000 - sonuçlar sırayla doğru", batch.Length == 5000 && batch.Select((v, i) => v == i + 1).All(x => x), $"{batchMs}ms");
+                var getFuncAdd = b.GetFunc<int>("Add", new object?[] { 0, 0 });
+                swb.Restart();
+                for (int i = 0; i < 5000; i++) getFuncAdd(new object?[] { i, 1 });
+                long singleMs = swb.ElapsedMilliseconds;
+                Console.WriteLine($"     (5000 çağrı: tek tek GetFunc {singleMs}ms, toplu {batchMs}ms)");
+                var asyncBatch = await b.InvokeBatchAsync<int>("AddAsync", new[] { new object?[] { 1, 2 }, new object?[] { 3, 4 } });
+                Check("Task<int> dönen metotla toplu çağrı", asyncBatch.SequenceEqual(new[] { 3, 7 }));
+                await ExpectAsync<PluginInvocationException>("toplu çağrıda 3. eleman (index 2) hata -> BatchIndex=2",
+                    () => b.InvokeBatchAsync<int>("CheckedDivide", new[] { new object?[] { 10, 2 }, new object?[] { 9, 3 }, new object?[] { 1, 0 }, new object?[] { 8, 4 } }),
+                    ex => ex.BatchIndex == 2 && ex.RemoteExceptionType == typeof(DivideByZeroException).FullName);
+                await b.ExecuteBatchAsync("DoSomething", new[] { new object?[] { 1 }, new object?[] { 2 }, new object?[] { 3 } });
+                Check("ExecuteBatchAsync - son çağrının etkisi görünüyor (field=3)", b.GetValue<int>("LastVoidCallValue") == 3);
+
+                Console.WriteLine("-- ForgetCache --");
+                b.ForgetCache();
+                Check("ForgetCache sonrası GetValue hâlâ doğru", b.GetValue<string>("DisplayName") == "yeni ad");
+            }
+
+            static async Task WaitUntil(Func<bool> cond, int timeoutMs = 5000)
+            {
+                var sw = Stopwatch.StartNew();
+                while (!cond() && sw.ElapsedMilliseconds < timeoutMs) await Task.Delay(10);
+            }
+
+            // 1) Sandbox, varsayılan görünürlük
+            await using (var h = new PluginWorkerHandle(dllPath, TypeName, Options()))
+            {
+                await h.StartAsync();
+                await RunScenarioAsync(h.Builder);
+            }
+
+            // 2) Sandbox, includeNonPublic
+            await using (var h = new PluginWorkerHandle(dllPath, TypeName, Options(), includeNonPublic: true))
+            {
+                await h.StartAsync();
+                await RunScenarioAsync(h.Builder);
+            }
+
+            // 3) In-process, varsayılan görünürlük
+            {
+                var loader = new ManagedDotNetPluginLoader();
+                await loader.LoadInProcessAsync(dllPath, TypeName);
+                await RunScenarioAsync(loader.Builder!.AsPluginBuilder());
+            }
+
+            // 4) In-process, includeNonPublic
+            {
+                var loader = new ManagedDotNetPluginLoader();
+                await loader.LoadInProcessAsync(dllPath, TypeName, includeNonPublic: true);
+                await RunScenarioAsync(loader.Builder!.AsPluginBuilder());
+            }
+
+            // 5) Sandbox'a özgü: GetFunc delegate'i ve builder worker restart'ından SONRA da çalışmalı
+            Console.WriteLine("\n===== SANDBOX: restart sonrası builder + önceden alınmış delegate =====");
+            await using (var h = new PluginWorkerHandle(dllPath, TypeName, Options(autoRestart: true)))
+            {
+                await h.StartAsync();
+                IPluginBuilder b = h.Builder;
+                var add = b.GetFunc<int>("Add", new object?[] { 0, 0 });
+                Check("restart öncesi add(1,2)=3", add(new object?[] { 1, 2 }) == 3);
+                b.SetValue("DisplayName", "restart öncesi");
+                int oldPid = h.ProcessId!.Value;
+                Process.GetProcessById(oldPid).Kill(entireProcessTree: true);
+                var until = DateTime.UtcNow.AddSeconds(10);
+                while ((h.Generation < 2 || h.IsDead) && DateTime.UtcNow < until) await Task.Delay(100);
+                Check("worker yeniden başladı (Generation=2)", h.Generation == 2 && !h.IsDead, $"gen={h.Generation}");
+                Check("AYNI delegate restart sonrası çalışıyor add(10,20)=30", add(new object?[] { 10, 20 }) == 30);
+                Check("builder restart sonrası çalışıyor", b.Invoke<int>("Add", 5, 5) == 10);
+                Check("state yeni process'te SIFIRDAN (bilinen davranış): DisplayName=default", b.GetValue<string>("DisplayName") == "default");
+                Check("restart ÖNCESİ kurulan event aboneliği restart SONRASI da çalışıyor", await EventAfterRestart());
+
+                async Task<bool> EventAfterRestart()
+                {
+                    // Abonelik restart öncesi kurulmuş olmalıydı - bunun için ikinci bir handle ile aynı akışı kısaca tekrar ediyoruz.
+                    await using var h2 = new PluginWorkerHandle(dllPath, TypeName, Options(autoRestart: true));
+                    await h2.StartAsync();
+                    int got = 0;
+                    using var sub = h2.Builder.Subscribe("CounterChanged", e => got = e.Get<int>(1));
+                    Process.GetProcessById(h2.ProcessId!.Value).Kill(entireProcessTree: true);
+                    var until2 = DateTime.UtcNow.AddSeconds(10);
+                    while ((h2.Generation < 2 || h2.IsDead) && DateTime.UtcNow < until2) await Task.Delay(100);
+                    await Task.Delay(300); // yeniden abonelik mesajının gitmesi için
+                    h2.Builder.Invoke<int>("Increment");
+                    await WaitUntil(() => got == 1);
+                    return got == 1;
+                }
+            }
+
+            // 6) Promote: IPluginBuilder'a yazılmış kod sandbox -> in-process geçişinde DEĞİŞMEDEN çalışmalı
+            Console.WriteLine("\n===== PROMOTE: aynı kod, sandbox'tan in-process'e =====");
+            static int BusinessLogic(IPluginBuilder b) => b.Invoke<int>("Add", 20, 22) + b.GetValue<int>("ReadOnlyValue");
+            var ph = new PluginWorkerHandle(dllPath, TypeName, Options());
+            await ph.StartAsync();
+            IPluginBuilder current = ph.Builder;
+            Check("iş kodu sandbox'ta = 52", BusinessLogic(current) == 52, current.IsSandboxed ? "sandbox" : "in-process");
+            var promotedLoader = await ph.PromoteToInProcessAsync();
+            current = promotedLoader.Builder!.AsPluginBuilder();
+            Check("AYNI iş kodu promote sonrası = 52", BusinessLogic(current) == 52, current.IsSandboxed ? "sandbox" : "in-process");
+            await ph.DisposeAsync();
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM PARİTE TESTLERİ GEÇTİ." : $"{failures} TEST BAŞARISIZ.");
+            //return failures == 0 ? 0 : 1;
+
+            // --- Ön kontrol: verilen SamplePlugin.dll bu test kitiyle aynı sürüm mü? ---
+            // (Eski bir build verilirse testler anlaşılmaz "metot bulunamadı" hatalarıyla kesiliyordu.)
+            static bool PreflightSamplePlugin(string dll)
+            {
+                var scan = DSO.Core.Evoker.Plugins.Scanning.PluginScanner.Scan(dll);
+                var t = scan.Types.FirstOrDefault(x => x.FullName == "TestPlugin.SamplePlugin");
+                var methods = t?.Methods.Select(m => m.Name).ToHashSet() ?? new HashSet<string>();
+                var events = t?.Events.Select(e => e.Name).ToHashSet() ?? new HashSet<string>();
+                var missing = new[] { "Add", "AddAsync", "MakePoint", "SlowAsync", "OptionalDemo", "UseDependency", "CheckedDivide", "RunWithProgress", "MoveTo", "Increment" }
+                    .Where(m => !methods.Contains(m))
+                    .Concat(new[] { "CounterChanged", "Progress", "PointMoved" }.Where(e => !events.Contains(e)).Select(e => "event " + e))
+                    .ToList();
+                if (missing.Count == 0) return true;
+                Console.WriteLine($"[ÖN KONTROL HATASI] Verilen SamplePlugin.dll bu test kitinden ESKİ: {dll}");
+                Console.WriteLine($"  Dosya tarihi: {File.GetLastWriteTime(dll):yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"  Eksik üyeler: {string.Join(", ", missing)}");
+                Console.WriteLine("  TestKit/SamplePlugin'i güncel SamplePlugin.cs + SamplePlugin.csproj (SampleDep referansı) ile yeniden derleyip");
+                Console.WriteLine("  testi o build çıktısındaki SamplePlugin.dll ile çalıştırın.");
+                return false;
+            }
+
+        }
+    }
+
+    public static class PariteTesti
+    {
+        static string PluginsFolderPath = Path.Combine(AppContext.BaseDirectory, "Plugins");
+        static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
+        static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
+        static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+
+        public static async Task TestParite()
+        {
+            // IPluginBuilder parite testi: AYNI senaryo gövdesi (RunScenarioAsync) hem sandbox (ayrı worker process,
+            // IPC) hem in-process (doğrudan EvokerBuilder) implementasyonuna karşı çalıştırılır. İkisi aynı sonucu
+            // vermeli - uygulama kodu IPluginBuilder'a bir kez yazılır, plugin nerede çalışırsa çalışsın değişmez.
+            //
+            // Kullanım: dotnet run -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
+            // NOT: Bu proje SamplePlugin'e derleme zamanı referans VERMİYOR - host plugin tiplerini (Point, Level)
+            // bilmiyor; kendi PointDto'sunu ve int'i kullanıyor (gerçek senaryo).
+
+
             const string TypeName = "TestPlugin.SamplePlugin";
 
             int failures = 0;
@@ -699,9 +1047,84 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 b.DefaultTimeoutMs = null;
                 Check("timeout sonrası çalışmaya devam", b.Invoke<int>("Add", 2, 2) == 4);
 
+                Console.WriteLine("-- Optional parametre + büyük/küçük harf (VB.NET) --");
+                Check("Greet(\"Ali\") - optional greeting varsayılanı", b.Invoke<string>("Greet", "Ali") == "Merhaba, Ali!");
+                Check("optionaldemo(1) küçük harf + 2 optional", b.Invoke<string>("optionaldemo", 1) == "1|5|x");
+                Check("OptionalDemo(1,2)", b.Invoke<string>("OptionalDemo", 1, 2) == "1|2|x");
+                Check("property küçük harf: displayname", b.GetValue<string>("displayname") == "yeni ad");
+                Check("GetFunc optional ile: sampleArgs 1 eleman", b.GetFunc<string>("OptionalDemo", new object?[] { 0 })(new object?[] { 7 }) == "7|5|x");
+
+                Console.WriteLine("-- Event'ler --");
+                var names = b.GetEventNames();
+                Check("GetEventNames", new[] { "CounterChanged", "PointMoved", "Progress" }.All(names.Contains), string.Join(",", names));
+                var counterValues = new System.Collections.Concurrent.ConcurrentQueue<int>();
+                object? senderSeen = "set edilmedi";
+                var counterSub = b.Subscribe("CounterChanged", e => { senderSeen = e[0]; counterValues.Enqueue(e.Get<int>(1)); });
+                int before = b.Invoke<int>("Increment");
+                int after = b.Invoke<int>("Increment");
+                await WaitUntil(() => counterValues.Count >= 2);
+                Check("EventHandler<int>: iki Increment -> iki event, doğru değerler", counterValues.SequenceEqual(new[] { before, after }), string.Join(",", counterValues));
+                Check("sender (plugin'in kendisi) null geliyor", senderSeen == null);
+                counterSub.Dispose();
+                await Task.Delay(100);
+                b.Invoke<int>("Increment");
+                await Task.Delay(200);
+                Check("Dispose sonrası event gelmiyor", counterValues.Count == 2, counterValues.Count.ToString());
+
+                var progress = new System.Collections.Concurrent.ConcurrentQueue<int>();
+                using (await b.SubscribeAsync("progress", e => progress.Enqueue(e.Get<int>(1))))   // küçük harf isim
+                {
+                    b.Invoke<int>("RunWithProgress", 200);
+                    await WaitUntil(() => progress.Count >= 200);
+                }
+                Check("Action<string,int> event, 200 bildirim, SIRA korunuyor", progress.SequenceEqual(Enumerable.Range(1, 200)), progress.Count.ToString());
+
+                PointDto? moved = null;
+                using (b.Subscribe("PointMoved", e => moved = e.Get<PointDto>(1)))
+                {
+                    b.Execute("MoveTo", 11, 12);
+                    await WaitUntil(() => moved != null);
+                }
+                Check("Complex event argümanı -> host DTO'su: PointMoved(11,12)", moved is { X: 11, Y: 12 }, $"{moved?.X},{moved?.Y}");
+
+                int okAfterThrow = 0;
+                using (b.Subscribe("CounterChanged", e => { okAfterThrow++; throw new Exception("handler hatası (kasıtlı)"); }))
+                {
+                    int c = b.Invoke<int>("Increment");
+                    await WaitUntil(() => okAfterThrow >= 1);
+                    Check("handler exception fırlatsa da plugin çağrısı başarılı döndü", c > 0);
+                }
+                Check("handler hatasından sonra plugin çalışıyor", b.Invoke<int>("Add", 1, 1) == 2);
+                await ExpectAsync<MissingMemberException>("olmayan event -> MissingMemberException", () => b.SubscribeAsync("YokBoyleEvent", _ => { }));
+
+                Console.WriteLine("-- Toplu çağrı (InvokeBatchAsync) --");
+                var batchArgs = Enumerable.Range(0, 5000).Select(i => new object?[] { i, 1 }).ToList();
+                var swb = Stopwatch.StartNew();
+                var batch = await b.InvokeBatchAsync<int>("Add", batchArgs);
+                long batchMs = swb.ElapsedMilliseconds;
+                Check("InvokeBatchAsync Add x5000 - sonuçlar sırayla doğru", batch.Length == 5000 && batch.Select((v, i) => v == i + 1).All(x => x), $"{batchMs}ms");
+                var getFuncAdd = b.GetFunc<int>("Add", new object?[] { 0, 0 });
+                swb.Restart();
+                for (int i = 0; i < 5000; i++) getFuncAdd(new object?[] { i, 1 });
+                long singleMs = swb.ElapsedMilliseconds;
+                Console.WriteLine($"     (5000 çağrı: tek tek GetFunc {singleMs}ms, toplu {batchMs}ms)");
+                var asyncBatch = await b.InvokeBatchAsync<int>("AddAsync", new[] { new object?[] { 1, 2 }, new object?[] { 3, 4 } });
+                Check("Task<int> dönen metotla toplu çağrı", asyncBatch.SequenceEqual(new[] { 3, 7 }));
+                await ExpectAsync<PluginInvocationException>("toplu çağrıda 3. eleman (index 2) hata -> BatchIndex=2",
+                    () => b.InvokeBatchAsync<int>("CheckedDivide", new[] { new object?[] { 10, 2 }, new object?[] { 9, 3 }, new object?[] { 1, 0 }, new object?[] { 8, 4 } }),
+                    ex => ex.BatchIndex == 2 && ex.RemoteExceptionType == typeof(DivideByZeroException).FullName);
+                await b.ExecuteBatchAsync("DoSomething", new[] { new object?[] { 1 }, new object?[] { 2 }, new object?[] { 3 } });
+                Check("ExecuteBatchAsync - son çağrının etkisi görünüyor (field=3)", b.GetValue<int>("LastVoidCallValue") == 3);
+
                 Console.WriteLine("-- ForgetCache --");
                 b.ForgetCache();
                 Check("ForgetCache sonrası GetValue hâlâ doğru", b.GetValue<string>("DisplayName") == "yeni ad");
+            }
+
+            static async Task WaitUntil(Func<bool> cond, int timeoutMs = 5000)
+            {
+                var sw = Stopwatch.StartNew();
+                while (!cond() && sw.ElapsedMilliseconds < timeoutMs) await Task.Delay(10);
             }
 
             // 1) Sandbox, varsayılan görünürlük
@@ -749,6 +1172,23 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 Check("AYNI delegate restart sonrası çalışıyor add(10,20)=30", add(new object?[] { 10, 20 }) == 30);
                 Check("builder restart sonrası çalışıyor", b.Invoke<int>("Add", 5, 5) == 10);
                 Check("state yeni process'te SIFIRDAN (bilinen davranış): DisplayName=default", b.GetValue<string>("DisplayName") == "default");
+                Check("restart ÖNCESİ kurulan event aboneliği restart SONRASI da çalışıyor", await EventAfterRestart());
+
+                async Task<bool> EventAfterRestart()
+                {
+                    // Abonelik restart öncesi kurulmuş olmalıydı - bunun için ikinci bir handle ile aynı akışı kısaca tekrar ediyoruz.
+                    await using var h2 = new PluginWorkerHandle(dllPath, TypeName, Options(autoRestart: true));
+                    await h2.StartAsync();
+                    int got = 0;
+                    using var sub = h2.Builder.Subscribe("CounterChanged", e => got = e.Get<int>(1));
+                    Process.GetProcessById(h2.ProcessId!.Value).Kill(entireProcessTree: true);
+                    var until2 = DateTime.UtcNow.AddSeconds(10);
+                    while ((h2.Generation < 2 || h2.IsDead) && DateTime.UtcNow < until2) await Task.Delay(100);
+                    await Task.Delay(300); // yeniden abonelik mesajının gitmesi için
+                    h2.Builder.Invoke<int>("Increment");
+                    await WaitUntil(() => got == 1);
+                    return got == 1;
+                }
             }
 
             // 6) Promote: IPluginBuilder'a yazılmış kod sandbox -> in-process geçişinde DEĞİŞMEDEN çalışmalı
@@ -765,8 +1205,6 @@ namespace DSO.Core.Evoker.Plugins.TestApi
 
             Console.WriteLine();
             Console.WriteLine(failures == 0 ? "TÜM PARİTE TESTLERİ GEÇTİ." : $"{failures} TEST BAŞARISIZ.");
-            //return failures == 0 ? 0 : 1;
-
 
         }
     }
@@ -777,4 +1215,5 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         public int Y { get; set; }
     }
 }
+
 

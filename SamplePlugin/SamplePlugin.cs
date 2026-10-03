@@ -88,7 +88,36 @@ namespace TestPlugin
 
         // State: aynı instance üzerinde çağrılar arasında korunmalı.
         public int Counter;
-        public int Increment() => ++Counter;
+        public int Increment()
+        {
+            ++Counter;
+            CounterChanged?.Invoke(this, Counter);
+            return Counter;
+        }
+
+        // --- Event testleri (in-process + sandbox) ---
+        public event EventHandler<int>? CounterChanged;
+        public event Action<string, int>? Progress;
+        public int RunWithProgress(int steps)
+        {
+            for (int i = 1; i <= steps; i++) Progress?.Invoke("adım", i);
+            return steps;
+        }
+        public event EventHandler<Point>? PointMoved;
+        public void MoveTo(int x, int y)
+        {
+            Location = new Point { X = x, Y = y };
+            PointMoved?.Invoke(this, Location);
+        }
+
+        // --- Toplu çağrı testi: b=0 olan çağrıda DivideByZeroException (BatchIndex doğrulaması) ---
+        public int CheckedDivide(int a, int b) => a / b;
+
+        // --- VB.NET Optional parametre testi ---
+        public string OptionalDemo(int a, int b = 5, string s = "x") => $"{a}|{b}|{s}";
+
+        // --- Plugin'in KENDİ bağımlılığı (AssemblyLoadContext bağımlılık çözümü + sürüm izolasyonu) ---
+        public string UseDependency() => SampleDep.DepHelper.Describe();
     }
 
     public enum Level { Low = 1, Mid = 2, High = 3 }

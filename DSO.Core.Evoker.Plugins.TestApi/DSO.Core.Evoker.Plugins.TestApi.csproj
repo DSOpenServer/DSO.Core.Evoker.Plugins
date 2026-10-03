@@ -54,6 +54,21 @@
     <None Update="Host\DSO.Core.SchemaBinarySerializer.pdb">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
+    <None Update="Host\System.Collections.Immutable.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Host\System.Reflection.Metadata.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Host\System.Reflection.MetadataLoadContext.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Plugins\SampleDep.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Plugins\SampleDep.pdb">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
     <None Update="Plugins\SamplePlugin.dll">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>

@@ -41,5 +41,12 @@ namespace DSO.Core.Evoker.Plugins.Loading
         /// extension'da yaşar (bkz. EvokerBuilderDynamicInvokeExtensions).
         /// </summary>
         Task<object?> InvokeAsync(string methodName, object?[] args);
+
+        /// <summary>
+        /// Plugin'i bellekten atar (in-process: kendi AssemblyLoadContext'i unload edilir, DLL dosyası
+        /// serbest kalır). true = gerçekten boşaltıldı; false = çağıranın elinde hâlâ plugin'e ait bir
+        /// referans var (bkz. ManagedDotNetPluginLoader.UnloadAsync). Loader bundan sonra kullanılamaz.
+        /// </summary>
+        Task<bool> UnloadAsync(int timeoutMs = 10_000);
     }
 }

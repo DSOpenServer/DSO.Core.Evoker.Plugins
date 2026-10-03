@@ -1,20 +1,27 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using DSO.Core.Evoker;
+using DSO.Core.Evoker.Plugins.Sandbox;
 using DSO.Core.Evoker.Plugins.Scanning;
 
 namespace DSO.Core.Evoker.Plugins.Loading
 {
     /// <summary>
-    /// In-process yol: gerçek Assembly.Load + EvokerBuilder kullanır. Host process'in kendi
-    /// belleğinde çalışır - izolasyon YOKTUR, sadece admin'in "bu DLL'e güveniyorum" dediği
-    /// durumda kullanılır (bkz. PluginWorkerHandle.PromoteAsync).
+    /// In-process yol: plugin DLL'i host'un kendi process'ine, ama KENDİNE AİT, kaldırılabilir
+    /// (collectible) bir <see cref="PluginLoadContext"/>'e yüklenir. Böylece:
+    ///   - plugin'in bağımlılıkları host'unkilerle çakışmaz (her plugin kendi sürümlerini kullanır),
+    ///   - <see cref="UnloadAsync"/> ile plugin bellekten GERÇEKTEN atılır ve DLL dosyası serbest kalır
+    ///     (sonra yeni sürümü yüklenebilir) - uygulamayı yeniden başlatmadan.
+    /// Crash izolasyonu YOKTUR (aynı process) - sadece admin'in "bu DLL'e güveniyorum" dediği durumda.
     ///
-    /// Bir loader BİR plugin instance'ına bağlıdır (bkz. IPluginLoader). Görevi SADECE güvenli
-    /// yükleme - LoadInProcessAsync tamamlanınca çağırma sorumluluğu tamamen Builder'a
-    /// (public EvokerBuilder) geçer. Builder'ın tüm public yüzeyi (Invoke&lt;T&gt;, InvokeAsync&lt;T&gt;,
-    /// Execute, ExecuteAsync, GetFunc, GetAction...) doğrudan kullanılabilir - loader bunun
-    /// üstüne kısıtlayıcı bir sarmalayıcı koymuyor.
+    /// Bir loader BİR plugin instance'ına bağlıdır. Görevi güvenli yükleme ve boşaltma; çağırma
+    /// sorumluluğu Builder'da (public EvokerBuilder) ya da Builder.AsPluginBuilder()'da.
     /// </summary>
     public sealed class ManagedDotNetPluginLoader : IPluginLoader
     {
@@ -23,57 +30,148 @@ namespace DSO.Core.Evoker.Plugins.Loading
         public object? Instance { get; private set; }
 
         /// <summary>
-        /// Load sonrası dolu, instance'a SetInstance ile bağlı. PUBLIC: loader'ın görevi bitti,
-        /// bundan sonrası EvokerBuilder'ın - tip bilerek Invoke&lt;T&gt;/InvokeAsync&lt;T&gt; çağırmak,
-        /// Execute/ExecuteAsync kullanmak, GetFunc/GetAction ile tekrar tekrar çağrılacak bir
-        /// delegate çıkarmak vb. hepsi doğrudan burada.
+        /// Load sonrası dolu, instance'a SetInstance ile bağlı. PUBLIC: loader'ın görevi bitti, bundan
+        /// sonrası EvokerBuilder'ın. UnloadAsync sonrası null.
         /// </summary>
         public EvokerBuilder? Builder { get; private set; }
 
+        /// <summary>Plugin'in yüklendiği context (tanılama). UnloadAsync sonrası null.</summary>
+        public PluginLoadContext? LoadContext { get; private set; }
+
+        /// <summary>Plugin'in ana assembly'si. UnloadAsync sonrası null.</summary>
+        public Assembly? PluginAssembly { get; private set; }
+
+        public bool IsUnloaded { get; private set; }
+
         /// <summary>
-        /// Assembly.LoadFrom ile GERÇEK yükleme + parametresiz constructor'ı DynamicEntityAccessor
-        /// üzerinden (Activator.CreateInstance DEĞİL - derlenmiş/cache'li yol, Evoker'ın geri kalanıyla
-        /// tutarlı) oluşturur. Tip adı ignoreCase:true ile aranıyor - VB.NET case-insensitive bir dil.
-        /// Bir loader üzerinde birden fazla kez çağrılamaz.
-        /// <paramref name="includeNonPublic"/> - bkz. IPluginLoader.LoadInProcessAsync: true ise
-        /// parametresiz constructor private/protected olsa da bulunur, VE sonrasında Builder üzerinden
-        /// yapılan tüm Invoke/Execute/GetValue/SetValue çağrıları private/protected/internal üyelere de
-        /// erişebilir (EvokerBuilder'a bu tek bayrak - constructor'ında - geçiliyor, bkz.
-        /// EvokerBuilder.IncludeNonPublic).
+        /// UnloadAsync sonrası context'in GC tarafından gerçekten toplanıp toplanmadığı (anlık kontrol,
+        /// GC tetiklemez). UnloadAsync false döndüyse, referanslar bırakıldıktan sonra bu tekrar kontrol edilebilir.
+        /// </summary>
+        public bool IsMemoryReleased => IsUnloaded && _contextRef != null && !_contextRef.IsAlive;
+
+        private WeakReference? _contextRef;
+
+        /// <summary>
+        /// Plugin DLL'ini kendi PluginLoadContext'ine yükler, tipi bulur (ignoreCase - VB.NET), parametresiz
+        /// constructor'la BİR instance oluşturur. includeNonPublic: bkz. IPluginLoader. Bir loader üzerinde
+        /// bir kez çağrılabilir.
         /// </summary>
         public Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false)
         {
-            if (Instance != null)
+            if (Instance != null || IsUnloaded)
                 throw new InvalidOperationException(
-                    "Bu loader zaten bir instance'a bağlı - her plugin yüklemesi için yeni bir ManagedDotNetPluginLoader oluşturun.");
-
+                    "Bu loader zaten kullanıldı - her plugin yüklemesi için yeni bir ManagedDotNetPluginLoader oluşturun.");
             if (string.IsNullOrWhiteSpace(filePath))
                 throw new ArgumentException("filePath boş olamaz.", nameof(filePath));
             if (string.IsNullOrWhiteSpace(typeFullName))
                 throw new ArgumentException("typeFullName boş olamaz.", nameof(typeFullName));
 
-            var assembly = System.Reflection.Assembly.LoadFrom(filePath);
-
-            var type = assembly.GetType(typeFullName, throwOnError: false, ignoreCase: true)
-                ?? throw new TypeLoadException(
-                    $"'{typeFullName}' tipi '{filePath}' içinde bulunamadı (case-insensitive arama dahil).");
-
-            object instance;
+            var context = new PluginLoadContext(filePath);
             try
             {
-                instance = DynamicEntityAccessor.GetConstructor(type, includeNonPublic)();
+                var assembly = context.LoadFromAssemblyPath(context.PluginPath);
+
+                var type = assembly.GetType(typeFullName, throwOnError: false, ignoreCase: true)
+                    ?? throw new TypeLoadException(
+                        $"'{typeFullName}' tipi '{filePath}' içinde bulunamadı (case-insensitive arama dahil).");
+
+                object instance;
+                try
+                {
+                    instance = DynamicEntityAccessor.GetConstructor(type, includeNonPublic)();
+                }
+                catch (MissingMethodException ex)
+                {
+                    throw new MissingMethodException(
+                        $"'{type.FullName}' türünün{(includeNonPublic ? "" : " (public)")} parametresiz " +
+                        "constructor'ı yok - plugin tipleri şu an parametresiz constructor'a sahip olmalı.", ex);
+                }
+
+                LoadContext = context;
+                PluginAssembly = assembly;
+                Instance = instance;
+                Builder = new EvokerBuilder(type, includeNonPublic).SetInstance(instance);
+                _contextRef = new WeakReference(context);
+                return Task.CompletedTask;
             }
-            catch (MissingMethodException ex)
+            catch
             {
-                throw new MissingMethodException(
-                    $"'{type.FullName}' türünün{(includeNonPublic ? "" : " (public)")} parametresiz " +
-                    "constructor'ı yok - plugin tipleri şu an parametresiz constructor'a sahip olmalı.", ex);
+                // Yarım kalan yüklemeyi de boşalt - dosya kilitli kalmasın.
+                PurgeCaches(context);
+                context.Unload();
+                throw;
             }
+        }
 
-            Instance = instance;
-            Builder = new EvokerBuilder(type, includeNonPublic).SetInstance(instance);
+        /// <summary>
+        /// Plugin'i bellekten atar:
+        ///   1) plugin tiplerine referans tutan TÜM statik cache'leri temizler (EvokerBuilder,
+        ///      DynamicEntityAccessor, InvokeDynamicAsync, WireValueCodec/JSON) - bunlar temizlenmezse
+        ///      context ASLA toplanamaz,
+        ///   2) Instance/Builder referanslarını bırakır, context.Unload() çağırır,
+        ///   3) GC ile context'in gerçekten toplandığını <paramref name="timeoutMs"/> içinde doğrular.
+        ///
+        /// true = plugin bellekten gitti, DLL serbest. false = hâlâ bir yerden referans tutuluyor:
+        /// ÇAĞIRANIN elinde kalan bir plugin nesnesi, Builder/AsPluginBuilder(), GetFunc/GetAction ile
+        /// alınmış delegate, kapatılmamış event aboneliği ya da plugin'in kendi başlattığı ve bitmeyen bir
+        /// thread/timer. Bunlar bırakılınca context yine de toplanır (Unload geri alınmaz).
+        /// </summary>
+        public async Task<bool> UnloadAsync(int timeoutMs = 10_000)
+        {
+            if (IsUnloaded) return _contextRef == null || !_contextRef.IsAlive;
+            if (LoadContext == null) throw new InvalidOperationException("Yüklenmemiş bir loader boşaltılamaz.");
 
-            return Task.CompletedTask;
+            IsUnloaded = true;
+            UnloadCore();
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (_contextRef!.IsAlive && sw.ElapsedMilliseconds < timeoutMs)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                if (!_contextRef.IsAlive) break;
+                await Task.Delay(50).ConfigureAwait(false);
+            }
+            return !_contextRef.IsAlive;
+        }
+
+        // Ayrı ve inline EDİLMEYEN metot: context/assembly/instance'a işaret eden yerel değişkenler bu
+        // metodun stack frame'inde kalır ve metot dönünce GC için görünmez olur.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void UnloadCore()
+        {
+            var context = LoadContext!;
+            PurgeCaches(context);
+
+            Instance = null;
+            Builder = null;
+            PluginAssembly = null;
+            LoadContext = null;
+            context.Unload();
+        }
+
+        /// <summary>Bu context'teki assembly'lerin tiplerine dokunan tüm statik cache'leri bırakır.</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal static void PurgeCaches(PluginLoadContext context)
+        {
+            foreach (var asm in context.Assemblies)
+            {
+                foreach (var t in SafeGetTypes(asm))
+                {
+                    EvokerBuilder.ForgetType(t);
+                    DynamicEntityAccessor.ForgetType(t);
+                }
+                EvokerBuilderDynamicInvokeExtensions.ForgetAssembly(asm);
+                WireValueCodec.ForgetAssembly(asm);
+            }
+        }
+
+        private static IEnumerable<Type> SafeGetTypes(Assembly asm)
+        {
+            try { return asm.GetTypes(); }
+            catch (ReflectionTypeLoadException ex) { return ex.Types.Where(t => t != null)!; }
+            catch { return Array.Empty<Type>(); }
         }
 
         /// <summary>
@@ -83,7 +181,7 @@ namespace DSO.Core.Evoker.Plugins.Loading
         public Task<object?> InvokeAsync(string methodName, object?[] args)
         {
             if (Builder == null)
-                throw new InvalidOperationException("Önce LoadInProcessAsync çağrılmalı.");
+                throw new InvalidOperationException(IsUnloaded ? "Plugin boşaltıldı (UnloadAsync)." : "Önce LoadInProcessAsync çağrılmalı.");
 
             return Builder.InvokeDynamicAsync(methodName, args);
         }

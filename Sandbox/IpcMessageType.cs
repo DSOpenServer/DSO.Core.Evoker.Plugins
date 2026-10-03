@@ -35,6 +35,16 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// Property/field okuma-yazma ya da worker tarafı cache temizliği (bkz. MemberRequest).
         /// Cevabı InvokeReply (5) ile döner - aynı CorrelationId/bekleyen-cevap mekanizması kullanılır.
         /// </summary>
-        Member = 10
+        Member = 10,
+
+        /// <summary>
+        /// Worker -> host: abone olunan bir plugin event'i tetiklendi. Payload: [SubscriptionId int][argümanlar].
+        /// Cevabı YOK (bildirim) - plugin, host'un handler'ını beklemez.
+        /// </summary>
+        EventRaised = 11,
+
+        /// <summary>Aynı metoda TEK frame'de N çağrı (sırayla çalıştırılır). Cevap: InvokeBatchReply.</summary>
+        InvokeBatch = 12,
+        InvokeBatchReply = 13
     }
 }

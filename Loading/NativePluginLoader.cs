@@ -26,6 +26,9 @@ namespace DSO.Core.Evoker.Plugins.Loading
                 "Native/başka-runtime plugin yükleme henüz implemente edilmedi. " +
                 "Bkz. NativePluginLoader.cs üstündeki not.");
 
+        public Task<bool> UnloadAsync(int timeoutMs = 10_000)
+            => throw new NotSupportedException("Native/başka-runtime plugin boşaltma henüz implemente edilmedi.");
+
         public Task<object?> InvokeAsync(string methodName, object?[] args)
             => throw new NotSupportedException(
                 "Native/başka-runtime plugin çağrısı henüz implemente edilmedi. " +

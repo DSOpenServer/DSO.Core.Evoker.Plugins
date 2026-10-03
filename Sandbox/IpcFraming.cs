@@ -78,6 +78,15 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         public Task WriteMemberRequestAsync(MemberRequest request, CancellationToken ct = default) =>
             WriteFrameAsync(IpcMessageType.Member, IpcMessageCodec.EncodeMemberRequest(request), ct);
 
+        public Task WriteInvokeBatchRequestAsync(InvokeBatchRequest request, CancellationToken ct = default) =>
+            WriteFrameAsync(IpcMessageType.InvokeBatch, IpcMessageCodec.EncodeInvokeBatchRequest(request), ct);
+
+        public Task WriteInvokeBatchReplyAsync(InvokeBatchReply reply, CancellationToken ct = default) =>
+            WriteFrameAsync(IpcMessageType.InvokeBatchReply, IpcMessageCodec.EncodeInvokeBatchReply(reply), ct);
+
+        public Task WriteEventRaisedAsync(int subscriptionId, WireValue[] args, CancellationToken ct = default) =>
+            WriteFrameAsync(IpcMessageType.EventRaised, IpcMessageCodec.EncodeEventRaised(subscriptionId, args), ct);
+
         public Task WritePingAsync(CancellationToken ct = default) =>
             WriteFrameAsync(IpcMessageType.Ping, ReadOnlyMemory<byte>.Empty, ct);
 

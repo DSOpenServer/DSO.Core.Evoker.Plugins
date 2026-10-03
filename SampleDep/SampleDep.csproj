@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- SamplePlugin'in KENDİ bağımlılığı - AssemblyLoadContext'in plugin klasöründen bağımlılık
+         çözmesini ve iki plugin kopyasının FARKLI sürümleri yan yana kullanmasını test etmek için. -->
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
