@@ -58,7 +58,29 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         private readonly ConcurrentDictionary<int, (int Generation, int WorkerHandle)> _handleMap = new();
 
         // CallAsync'in (isimle çağırma kolaylığı) kendi resolve cache'i - restart'ta temizlenir.
-        private readonly ConcurrentDictionary<(string Method, string ArgShape), int> _callHandleCache = new();
+        private readonly ConcurrentDictionary<(string Method, ShapeKey ArgShape), int> _callHandleCache = new();
+
+        // Argüman tip kodları şekli: 8 argümana kadar tek bir ulong'a paketlenir (allocation yok);
+        // daha fazlası için string. Eskiden her çağrıda string.Join ile string üretiliyordu.
+        private readonly struct ShapeKey : IEquatable<ShapeKey>
+        {
+            private readonly int _count;
+            private readonly ulong _packed;
+            private readonly string? _overflow;
+
+            public ShapeKey(WireTypeCode[] codes)
+            {
+                _count = codes.Length;
+                _packed = 0;
+                _overflow = null;
+                if (codes.Length > 8) { _overflow = string.Join(",", codes); return; }
+                for (int i = 0; i < codes.Length; i++) _packed |= (ulong)(byte)codes[i] << (i * 8);
+            }
+
+            public bool Equals(ShapeKey o) => _count == o._count && _packed == o._packed && string.Equals(_overflow, o._overflow, StringComparison.Ordinal);
+            public override bool Equals(object? obj) => obj is ShapeKey k && Equals(k);
+            public override int GetHashCode() => HashCode.Combine(_count, _packed, _overflow);
+        }
 
         // --- Event abonelikleri ---
         // Host tarafında tutulan kayıt restart'tan SAĞ ÇIKAR: yeni worker'a otomatik yeniden abone olunur.
@@ -292,34 +314,62 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// _pending'e ekle, cevabı bekle. timeoutMs SADECE bu çağrıyı etkiler - worker'ı ETKİLEMEZ,
         /// zaman aşımında sadece bu bekleyiş bırakılır (bkz. InvokeRequest.TimeoutMs'in kendi notu).
         /// </summary>
-        public async Task<InvokeReply> InvokeAsync(int methodHandle, WireValue[] args, int? timeoutMs = null)
+        public Task<InvokeReply> InvokeAsync(int methodHandle, WireValue[] args, int? timeoutMs = null)
         {
-            EnsureAlive();
+            try { EnsureAlive(); }
+            catch (Exception ex) { return Task.FromException<InvokeReply>(ex); } // eski async davranışı: hata Task'ta
 
             // Hiç verilmemiş bir handle: worker'a HİÇ gönderilmeden temiz bir Success=false dönülür
             // (worker'ın kendi handle numaraları ile tesadüfen çakışıp yanlış metodu çağırmasın diye).
             // ÖNCEKİ bir nesilde verilmiş bir handle: StaleMethodHandleException (bkz. _generation notu).
             if (!_handleMap.TryGetValue(methodHandle, out var mapped))
             {
-                return new InvokeReply
+                return Task.FromResult(new InvokeReply
                 {
                     Success = false,
                     ExceptionType = nameof(MissingMethodException),
                     ExceptionMessage = $"Bilinmeyen MethodHandle: {methodHandle} (önce ResolveAsync çağrılmalı)."
-                };
+                });
             }
             if (mapped.Generation != Generation)
-                throw new StaleMethodHandleException(methodHandle, mapped.Generation, Generation);
+                return Task.FromException<InvokeReply>(new StaleMethodHandleException(methodHandle, mapped.Generation, Generation));
 
-            return await SendAndWaitAsync(
-                (correlationId, ct) => _writer!.WriteInvokeRequestAsync(new InvokeRequest
-                {
-                    CorrelationId = correlationId,
-                    MethodHandle = mapped.WorkerHandle,
-                    Args = args,
-                    TimeoutMs = timeoutMs
-                }, ct),
-                timeoutMs, "Invoke").ConfigureAwait(false);
+            return SendInvokeAsync(mapped.WorkerHandle, args, timeoutMs);
+        }
+
+        // Invoke'un sıcak yolu: gate -> CorrelationId -> (InvokeRequest nesnesi ve closure OLMADAN) yaz -> bekle.
+        private async Task<InvokeReply> SendInvokeAsync(int workerHandle, WireValue[] args, int? timeoutMs)
+        {
+            await _concurrencyGate!.WaitAsync().ConfigureAwait(false);
+            long correlationId = Interlocked.Increment(ref _correlationCounter);
+            var tcs = new TaskCompletionSource<InvokeReply>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pending[correlationId] = tcs;
+            try
+            {
+                await _writer!.WriteInvokeRequestAsync(correlationId, workerHandle, timeoutMs, args).ConfigureAwait(false);
+                if (timeoutMs.HasValue) await WaitWithTimeoutAsync(tcs.Task, timeoutMs.Value, "Invoke").ConfigureAwait(false);
+                return await tcs.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                _pending.TryRemove(correlationId, out _);
+                _concurrencyGate.Release();
+            }
+        }
+
+        // Zaman aşımı: Task.Delay yerine iptal edilebilir bekleme - cevap ZAMANINDA gelirse zamanlayıcı hemen
+        // bırakılır (eskiden her zaman aşımlı çağrı, süre dolana kadar yaşayan bir Task.Delay bırakıyordu).
+        private static async Task WaitWithTimeoutAsync(Task task, int timeoutMs, string what)
+        {
+            if (task.IsCompleted) return;
+            using var cts = new CancellationTokenSource();
+            var delay = Task.Delay(timeoutMs, cts.Token);
+            var winner = await Task.WhenAny(task, delay).ConfigureAwait(false);
+            cts.Cancel();
+            if (winner != task)
+                throw new TimeoutException(
+                    $"[PluginWorkerHandle] {what} {timeoutMs}ms içinde cevap vermedi (worker ETKİLENMEDİ, " +
+                    "sadece bu çağrı zaman aşımına uğradı - bkz. InvokeRequest.TimeoutMs).");
         }
 
         /// <summary>
@@ -331,13 +381,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         {
             EnsureAlive();
             return SendAndWaitAsync(
-                (correlationId, ct) => _writer!.WriteMemberRequestAsync(new MemberRequest
-                {
-                    CorrelationId = correlationId,
-                    Operation = operation,
-                    MemberName = memberName ?? "",
-                    Value = value
-                }, ct),
+                (correlationId, ct) => _writer!.WriteMemberRequestAsync(correlationId, operation, memberName ?? "", value, ct),
                 timeoutMs, operation.ToString());
         }
 
@@ -372,12 +416,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                     ArgsList = argsList
                 }).ConfigureAwait(false);
 
-                if (timeoutMs.HasValue)
-                {
-                    var winner = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs.Value)).ConfigureAwait(false);
-                    if (winner != tcs.Task)
-                        throw new TimeoutException($"[PluginWorkerHandle] InvokeBatch {timeoutMs.Value}ms içinde cevap vermedi (worker ETKİLENMEDİ).");
-                }
+                if (timeoutMs.HasValue) await WaitWithTimeoutAsync(tcs.Task, timeoutMs.Value, "InvokeBatch").ConfigureAwait(false);
                 return await tcs.Task.ConfigureAwait(false);
             }
             finally
@@ -393,7 +432,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// </summary>
         internal async Task<int> ResolveCachedAsync(string methodName, WireTypeCode[] codes)
         {
-            var key = (methodName, string.Join(",", codes));
+            var key = (methodName, new ShapeKey(codes));
             if (_callHandleCache.TryGetValue(key, out int handle)) return handle;
             handle = await ResolveAsync(TypeFullName, methodName, codes).ConfigureAwait(false);
             _callHandleCache[key] = handle;
@@ -401,7 +440,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         }
 
         internal void ForgetCachedHandle(string methodName, WireTypeCode[] codes) =>
-            _callHandleCache.TryRemove((methodName, string.Join(",", codes)), out _);
+            _callHandleCache.TryRemove((methodName, new ShapeKey(codes)), out _);
 
         // Invoke ve Member isteklerinin ortak yolu: gate -> CorrelationId -> yaz -> (opsiyonel timeout ile) bekle.
         private async Task<InvokeReply> SendAndWaitAsync(Func<long, CancellationToken, Task> write, int? timeoutMs, string what)
@@ -414,14 +453,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             {
                 await write(correlationId, CancellationToken.None).ConfigureAwait(false);
 
-                if (timeoutMs.HasValue)
-                {
-                    var winner = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs.Value)).ConfigureAwait(false);
-                    if (winner != tcs.Task)
-                        throw new TimeoutException(
-                            $"[PluginWorkerHandle] {what} {timeoutMs.Value}ms içinde cevap vermedi (worker ETKİLENMEDİ, " +
-                            "sadece bu çağrı zaman aşımına uğradı - bkz. InvokeRequest.TimeoutMs).");
-                }
+                if (timeoutMs.HasValue) await WaitWithTimeoutAsync(tcs.Task, timeoutMs.Value, what).ConfigureAwait(false);
 
                 return await tcs.Task.ConfigureAwait(false);
             }
@@ -471,7 +503,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 codes[i] = wireArgs[i].TypeCode;
             }
 
-            var key = (methodName, string.Join(",", codes));
+            var key = (methodName, new ShapeKey(codes));
             for (int attempt = 0; ; attempt++)
             {
                 if (!_callHandleCache.TryGetValue(key, out int handle))

@@ -42,6 +42,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 if (Involves(t, assembly)) SchemaSerializers.TryRemove(t, out _);
             foreach (var t in SchemaDeserializers.Keys)
                 if (Involves(t, assembly)) SchemaDeserializers.TryRemove(t, out _);
+            CompiledShapeMapper.ForgetAssembly(assembly, Involves);
             Volatile.Write(ref _jsonOptions, new JsonSerializerOptions());
             ClearSystemTextJsonGlobalCaches();
         }
@@ -192,6 +193,11 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
             if (value is IConvertible && typeof(IConvertible).IsAssignableFrom(underlying))
                 return Convert.ChangeType(value, underlying, System.Globalization.CultureInfo.InvariantCulture);
+
+            // Aynı şekle sahip farklı tipler (ör. plugin Point ↔ host PointDto): derlenmiş kopyalayıcı - JSON ile
+            // aynı sonucu ~20-50 kat hızlı üretir; şekil emin olunamayacak kadar karmaşıksa null döner ve JSON'a düşülür.
+            var mapper = CompiledShapeMapper.Get(value.GetType(), targetType);
+            if (mapper != null) return mapper(value);
 
             // Son çare: JSON üzerinden şekil eşlemesi (ör. worker'ın gerçek Point'i host'ta yüklüyse ama
             // çağıran kendi PointDto'sunu istiyorsa).

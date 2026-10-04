@@ -63,7 +63,8 @@ catch (Exception ex)
     return 1;
 }
 
-var handleTable = new System.Collections.Concurrent.ConcurrentDictionary<int, (string MethodName, MethodInfo Representative)>();
+// ParamTypes resolve anında BİR KEZ çıkarılır (eskiden her çağrıda GetParameters + LINQ).
+var handleTable = new System.Collections.Concurrent.ConcurrentDictionary<int, (string MethodName, MethodInfo Representative, Type[] ParamTypes)>();
 int handleCounter = 0;
 var concurrencyGate = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 // Event abonelikleri: host'un verdiği abonelik id'si -> worker'daki gerçek abonelik (Dispose = çık).
@@ -173,7 +174,7 @@ void HandleResolve(ResolveRequest request)
         {
             var representative = candidates[0];
             int handle = Interlocked.Increment(ref handleCounter);
-            handleTable[handle] = (request.MethodName, representative);
+            handleTable[handle] = (request.MethodName, representative, representative.GetParameters().Select(p => p.ParameterType).ToArray());
             reply = new ResolveReply { Success = true, MethodHandle = handle };
         }
     }
@@ -201,8 +202,7 @@ async Task HandleInvokeAsync(InvokeRequest request)
         {
             try
             {
-                var paramTypes = entry.Representative.GetParameters().Select(p => p.ParameterType).ToArray();
-                var decodedArgs = DecodeArgs(request.Args, paramTypes);
+                var decodedArgs = DecodeArgs(request.Args, entry.ParamTypes);
 
                 // builder.InvokeDynamicAsync: void/Task/Task<T>/senkron şeklini kendisi tespit
                 // eder (bkz. EvokerBuilderDynamicInvokeExtensions) - burada TEKRAR yazılmıyor.
@@ -264,7 +264,7 @@ async Task HandleInvokeBatchAsync(InvokeBatchRequest request)
         if (!handleTable.TryGetValue(request.MethodHandle, out var entry))
             throw new MissingMethodException($"Bilinmeyen MethodHandle: {request.MethodHandle} (önce Resolve çağrılmalı).");
 
-        var paramTypes = entry.Representative.GetParameters().Select(p => p.ParameterType).ToArray();
+        var paramTypes = entry.ParamTypes;
         var results = new WireValue[request.ArgsList.Length];
         for (index = 0; index < request.ArgsList.Length; index++)
         {

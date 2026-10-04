@@ -73,6 +73,25 @@ namespace DSO.Core.Evoker.Plugins
         Action<object?[]> GetAction(string methodName, object?[]? sampleArgs = null);
         Func<object?[], Task> GetActionAsync(string methodName, object?[]? sampleArgs = null);
 
+        // --- Tipli delegate'ler (sıkı döngüler için; argüman/dönüş tipleri derleme zamanında belli) ---
+        /// <summary>
+        /// Örn: <c>var add = b.GetTypedFunc&lt;int, int, int&gt;("Add"); int s = add(1, 2);</c>
+        /// In-process'te mümkün olduğunda EvokerBuilder'ın derlenmiş, object[]/boxing'siz delegate'i kullanılır
+        /// (argüman/dönüş tipi metodunkiyle doğrudan dönüştürülebiliyorsa). Değilse (host DTO'su ↔ plugin tipi,
+        /// Task dönüşü) Invoke ile aynı kurallarla çalışan genel yola düşer - sonuç aynı, sadece daha yavaş.
+        /// Sandbox'ta her çağrı yine IPC'dir (GetFunc ile aynı). Hata sözleşmesi Invoke ile aynı.
+        /// </summary>
+        Func<TResult?> GetTypedFunc<TResult>(string methodName);
+        Func<T1, TResult?> GetTypedFunc<T1, TResult>(string methodName);
+        Func<T1, T2, TResult?> GetTypedFunc<T1, T2, TResult>(string methodName);
+        Func<T1, T2, T3, TResult?> GetTypedFunc<T1, T2, T3, TResult>(string methodName);
+        Func<T1, T2, T3, T4, TResult?> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName);
+        Action GetTypedAction(string methodName);
+        Action<T1> GetTypedAction<T1>(string methodName);
+        Action<T1, T2> GetTypedAction<T1, T2>(string methodName);
+        Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName);
+        Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName);
+
         // --- Event'ler ---
         /// <summary>
         /// Plugin event'ine abone ol; dönen nesne Dispose edilince çıkılır. Argümanlar için bkz. PluginEventArgs

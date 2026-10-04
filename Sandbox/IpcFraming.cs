@@ -1,5 +1,8 @@
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.IO;
+using System.Text;
 using System.IO.Pipes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,6 +24,11 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
     /// Frame formatı: [4 byte little-endian uzunluk N][N byte: 1 byte IpcMessageType + (N-1) byte payload]
     /// Uzunluk, type byte'ı DAHİL sonraki byte sayısını gösterir - böylece okuyan taraf tek bir
     /// "N byte oku" adımıyla hem type'ı hem payload'ı aynı buffer'dan çıkarabilir.
+    ///
+    /// PERFORMANS (optimizasyon turu): başlık + payload artık TEK tamponda ve TEK yazma çağrısıyla gidiyor
+    /// (eskiden başlık için ayrı dizi + iki WriteAsync). Mesajlar thread başına yeniden kullanılan bir tampona
+    /// encode edilip ArrayPool'dan kiralanan diziye kopyalanır - mesaj başına MemoryStream/BinaryWriter/ToArray
+    /// allocation'ı yok.
     /// </summary>
     public sealed class IpcWriter
     {
@@ -29,67 +37,120 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
         public IpcWriter(PipeStream pipe) => _pipe = pipe;
 
+        private const int HeaderSize = 5;
+        private const int MaxRetainedEncodeBuffer = 1 << 20; // 1 MB üstü büyümüş tamponu tutma
+
+        // Encode SENKRON yapılır (ilk await'ten önce) - thread'e özel tampon güvenle yeniden kullanılır.
+        [ThreadStatic] private static MemoryStream? t_encodeStream;
+        [ThreadStatic] private static BinaryWriter? t_encodeWriter;
+
         /// <summary>
         /// TODO 6: Length-prefix + type byte + payload'ı pipe'a yaz. _writeLock ile serialize edilir -
         /// MaxConcurrency > 1 olduğunda birden fazla thread aynı anda cevap yazmaya çalışabilir,
         /// iki mesajın byte'ları asla iç içe geçmemeli.
         /// </summary>
-        public async Task WriteFrameAsync(IpcMessageType type, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
+        public Task WriteFrameAsync(IpcMessageType type, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
         {
-            // Header'ı (uzunluk + type) TEK bir buffer'da hazırlıyoruz ki pipe'a yazma ARASINDA
-            // (write lock altında bile) iki ayrı WriteAsync çağrısı arasında bir iptal/hata payload'ı
-            // header'sız veya header'ı payload'sız bırakmasın - tek bir mantıksal "frame header" yazımı.
-            var header = new byte[5];
-            int totalLength = checked(payload.Length + 1); // type byte dahil
-            BitConverter.GetBytes(totalLength).CopyTo(header, 0);
-            header[4] = (byte)type;
+            int total = HeaderSize + payload.Length;
+            var buffer = ArrayPool<byte>.Shared.Rent(total);
+            BinaryPrimitives.WriteInt32LittleEndian(buffer, checked(payload.Length + 1)); // type byte dahil
+            buffer[4] = (byte)type;
+            payload.Span.CopyTo(buffer.AsSpan(HeaderSize));
+            return SendPooledAsync(buffer, total, ct);
+        }
 
-            await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        /// <summary>Mesajı (encode delegesiyle) doğrudan frame tamponuna yazar ve gönderir.</summary>
+        internal Task WriteEncodedAsync<TState>(IpcMessageType type, TState state, Action<BinaryWriter, TState> encode, CancellationToken ct = default)
+        {
+            var ms = t_encodeStream ??= new MemoryStream(256);
+            var bw = t_encodeWriter ??= new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+            byte[] buffer;
+            int total;
             try
             {
-                await _pipe.WriteAsync(header, ct).ConfigureAwait(false);
-                if (payload.Length > 0)
-                    await _pipe.WriteAsync(payload, ct).ConfigureAwait(false);
-                await _pipe.FlushAsync(ct).ConfigureAwait(false);
+                ms.Position = HeaderSize;
+                ms.SetLength(HeaderSize);
+                encode(bw, state);
+                bw.Flush();
+                total = (int)ms.Length;
+                buffer = ArrayPool<byte>.Shared.Rent(total);
+                ms.GetBuffer().AsSpan(HeaderSize, total - HeaderSize).CopyTo(buffer.AsSpan(HeaderSize));
             }
             finally
             {
-                _writeLock.Release();
+                if (ms.Capacity > MaxRetainedEncodeBuffer) { t_encodeStream = null; t_encodeWriter = null; }
+            }
+            BinaryPrimitives.WriteInt32LittleEndian(buffer, total - 4); // type byte dahil uzunluk
+            buffer[4] = (byte)type;
+            return SendPooledAsync(buffer, total, ct);
+        }
+
+        private async Task SendPooledAsync(byte[] buffer, int length, CancellationToken ct)
+        {
+            try
+            {
+                await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    // Tek yazma: başlık ile payload asla ayrı ayrı gitmez (iptal/hata yarım frame bırakmasın).
+                    await _pipe.WriteAsync(buffer.AsMemory(0, length), ct).ConfigureAwait(false);
+                    await _pipe.FlushAsync(ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 
-        // TODO 7: yüksek seviye yardımcı metodlar - IpcMessageCodec'e (TODO 7/8) delege ediyor.
+        // TODO 7: yüksek seviye yardımcı metodlar - IpcMessageCodec'e delege ediyor.
 
         /// <param name="protocolVersion">
         /// Worker bunu KENDİ kodundan "IpcProtocol.Version" olarak geçmeli: const, çağıranın (worker exe'sinin)
         /// içine derlenir - böylece eski bir exe'nin yanında yeni bir Plugins DLL'i olsa bile exe'nin gerçek sürümü gider.
         /// </param>
         public Task WriteHelloAsync(bool success, string? typeFullName, string? error, int protocolVersion, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.Hello, IpcMessageCodec.EncodeHello(success, typeFullName, error, protocolVersion), ct);
+            WriteEncodedAsync(IpcMessageType.Hello, (success, typeFullName, error, protocolVersion),
+                static (bw, s) => IpcMessageCodec.WriteHello(bw, s.success, s.typeFullName, s.error, s.protocolVersion), ct);
 
         public Task WriteResolveRequestAsync(ResolveRequest request, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.Resolve, IpcMessageCodec.EncodeResolveRequest(request), ct);
+            WriteEncodedAsync(IpcMessageType.Resolve, request, IpcMessageCodec.WriteResolveRequest, ct);
 
         public Task WriteResolveReplyAsync(ResolveReply reply, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.ResolveReply, IpcMessageCodec.EncodeResolveReply(reply), ct);
+            WriteEncodedAsync(IpcMessageType.ResolveReply, reply, IpcMessageCodec.WriteResolveReply, ct);
 
         public Task WriteInvokeRequestAsync(InvokeRequest request, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.Invoke, IpcMessageCodec.EncodeInvokeRequest(request), ct);
+            WriteInvokeRequestAsync(request.CorrelationId, request.MethodHandle, request.TimeoutMs, request.Args, ct);
+
+        /// <summary>InvokeRequest nesnesi oluşturmadan (sıcak yol).</summary>
+        public Task WriteInvokeRequestAsync(long correlationId, int methodHandle, int? timeoutMs, WireValue[] args, CancellationToken ct = default) =>
+            WriteEncodedAsync(IpcMessageType.Invoke, (correlationId, methodHandle, timeoutMs, args),
+                static (bw, s) => IpcMessageCodec.WriteInvokeRequest(bw, s.correlationId, s.methodHandle, s.timeoutMs, s.args), ct);
 
         public Task WriteInvokeReplyAsync(InvokeReply reply, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.InvokeReply, IpcMessageCodec.EncodeInvokeReply(reply), ct);
+            WriteEncodedAsync(IpcMessageType.InvokeReply, reply, IpcMessageCodec.WriteInvokeReply, ct);
 
         public Task WriteMemberRequestAsync(MemberRequest request, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.Member, IpcMessageCodec.EncodeMemberRequest(request), ct);
+            WriteMemberRequestAsync(request.CorrelationId, request.Operation, request.MemberName, request.Value, ct);
+
+        /// <summary>MemberRequest nesnesi oluşturmadan (sıcak yol).</summary>
+        public Task WriteMemberRequestAsync(long correlationId, MemberOperation operation, string memberName, WireValue value, CancellationToken ct = default) =>
+            WriteEncodedAsync(IpcMessageType.Member, (correlationId, operation, memberName, value),
+                static (bw, s) => IpcMessageCodec.WriteMemberRequest(bw, s.correlationId, s.operation, s.memberName, s.value), ct);
 
         public Task WriteInvokeBatchRequestAsync(InvokeBatchRequest request, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.InvokeBatch, IpcMessageCodec.EncodeInvokeBatchRequest(request), ct);
+            WriteEncodedAsync(IpcMessageType.InvokeBatch, request, IpcMessageCodec.WriteInvokeBatchRequest, ct);
 
         public Task WriteInvokeBatchReplyAsync(InvokeBatchReply reply, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.InvokeBatchReply, IpcMessageCodec.EncodeInvokeBatchReply(reply), ct);
+            WriteEncodedAsync(IpcMessageType.InvokeBatchReply, reply, IpcMessageCodec.WriteInvokeBatchReply, ct);
 
         public Task WriteEventRaisedAsync(int subscriptionId, WireValue[] args, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.EventRaised, IpcMessageCodec.EncodeEventRaised(subscriptionId, args), ct);
+            WriteEncodedAsync(IpcMessageType.EventRaised, (subscriptionId, args),
+                static (bw, s) => IpcMessageCodec.WriteEventRaised(bw, s.subscriptionId, s.args), ct);
 
         public Task WritePingAsync(CancellationToken ct = default) =>
             WriteFrameAsync(IpcMessageType.Ping, ReadOnlyMemory<byte>.Empty, ct);
@@ -101,14 +162,26 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             WriteFrameAsync(IpcMessageType.Shutdown, ReadOnlyMemory<byte>.Empty, ct);
 
         public Task WriteFaultAsync(string message, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.Fault, IpcMessageCodec.EncodeFault(message), ct);
+            WriteEncodedAsync(IpcMessageType.Fault, message, static (bw, m) => IpcMessageCodec.WriteFault(bw, m), ct);
     }
 
+    /// <summary>
+    /// Frame okuyucu. TEK bir okuma döngüsü tarafından kullanılır (eşzamanlı ReadFrameAsync desteklenmez).
+    ///
+    /// PERFORMANS (optimizasyon turu): pipe'tan 64 KB'lık bloklar halinde okunur ve frame'ler bu tampondan
+    /// çıkarılır - küçük bir mesaj (başlık + gövde) çoğu zaman TEK okuma sistem çağrısıyla gelir (eskiden en az
+    /// iki: önce 4 byte uzunluk, sonra gövde) ve art arda gelen frame'ler aynı okumayla alınır. Payload doğrudan
+    /// kendi dizisine kopyalanır (eskiden gövde dizisi + payload'a ikinci kopya).
+    /// </summary>
     public sealed class IpcReader
     {
         private readonly PipeStream _pipe;
+        private readonly byte[] _buf = new byte[64 * 1024];
+        private int _start, _end; // _buf[_start.._end) okunmuş ama tüketilmemiş veri
 
         public IpcReader(PipeStream pipe) => _pipe = pipe;
+
+        private int Buffered => _end - _start;
 
         /// <summary>
         /// TODO 9: Bir frame'in tamamını okuyup (length-prefix'e göre) (IpcMessageType, payload)
@@ -119,50 +192,61 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// </summary>
         public async Task<(IpcMessageType Type, byte[] Payload)> ReadFrameAsync(CancellationToken ct = default)
         {
-            var lengthBuffer = new byte[4];
-            int read = await ReadExactAsync(lengthBuffer, allowZeroAtStart: true, ct).ConfigureAwait(false);
-            if (read == 0)
-                throw new PluginWorkerDisconnectedException("Pipe iki frame arasında temiz şekilde kapandı (worker kapandı/öldü).");
+            // Başlık (uzunluk + type) = 5 byte; uzunluk >= 1 olduğu için her geçerli frame'de en az 5 byte vardır.
+            if (Buffered < 5)
+            {
+                bool cleanClose = await FillAtLeastAsync(5, ct).ConfigureAwait(false);
+                if (cleanClose)
+                    throw new PluginWorkerDisconnectedException("Pipe iki frame arasında temiz şekilde kapandı (worker kapandı/öldü).");
+            }
 
-            int totalLength = BitConverter.ToInt32(lengthBuffer, 0);
+            int totalLength = BinaryPrimitives.ReadInt32LittleEndian(_buf.AsSpan(_start, 4));
             if (totalLength < 1)
                 throw new PluginWorkerDisconnectedException($"Bozuk frame: uzunluk {totalLength} (en az 1 - type byte'ı - olmalı).");
+            var type = (IpcMessageType)_buf[_start + 4];
+            _start += 5;
 
-            var body = new byte[totalLength];
-            int bodyRead = await ReadExactAsync(body, allowZeroAtStart: false, ct).ConfigureAwait(false);
-            if (bodyRead < totalLength)
-                throw new PluginWorkerDisconnectedException("Pipe bir frame'in ORTASINDA koptu (worker beklenmedik şekilde öldü).");
+            int payloadLength = totalLength - 1;
+            if (payloadLength == 0) return (type, Array.Empty<byte>());
 
-            var type = (IpcMessageType)body[0];
-            byte[] payload = totalLength == 1 ? Array.Empty<byte>() : new byte[totalLength - 1];
-            if (payload.Length > 0)
-                Array.Copy(body, 1, payload, 0, payload.Length);
+            var payload = new byte[payloadLength];
+            int copied = Math.Min(Buffered, payloadLength);
+            Buffer.BlockCopy(_buf, _start, payload, 0, copied);
+            _start += copied;
 
+            // Tampondakinden büyük payload: kalanı DOĞRUDAN hedef diziye oku (ara kopya yok).
+            while (copied < payloadLength)
+            {
+                int n = await _pipe.ReadAsync(payload.AsMemory(copied), ct).ConfigureAwait(false);
+                if (n == 0)
+                    throw new PluginWorkerDisconnectedException("Pipe bir frame'in ORTASINDA koptu (worker beklenmedik şekilde öldü).");
+                copied += n;
+            }
             return (type, payload);
         }
 
-        /// <summary>
-        /// buffer'ı TAMAMEN dolduruncaya kadar okur (PipeStream.ReadAsync kısmi okuma yapabilir).
-        /// allowZeroAtStart=true iken İLK ReadAsync çağrısı 0 dönerse (pipe iki frame arasında temiz
-        /// kapanmış) bunu 0 olarak yukarı taşır - exception DEĞİL, normal bir "bağlantı bitti" sinyali.
-        /// Kısmi okuma sonrası bağlantı koparsa (0 dönerse) IOException fırlatılır - bu GERÇEKTEN
-        /// beklenmedik bir kopma (frame'in ortasında).
-        /// </summary>
-        private async Task<int> ReadExactAsync(byte[] buffer, bool allowZeroAtStart, CancellationToken ct)
+        // Tamponda en az 'count' byte olana kadar okur. true = hiç veri yokken pipe temiz kapandı.
+        private async Task<bool> FillAtLeastAsync(int count, CancellationToken ct)
         {
-            int totalRead = 0;
-            while (totalRead < buffer.Length)
+            if (_start > 0)
             {
-                int n = await _pipe.ReadAsync(buffer.AsMemory(totalRead), ct).ConfigureAwait(false);
+                // Tüketilmemiş kısmı başa kaydır (en fazla birkaç byte).
+                int left = Buffered;
+                if (left > 0) Buffer.BlockCopy(_buf, _start, _buf, 0, left);
+                _start = 0;
+                _end = left;
+            }
+            while (_end < count)
+            {
+                int n = await _pipe.ReadAsync(_buf.AsMemory(_end), ct).ConfigureAwait(false);
                 if (n == 0)
                 {
-                    if (totalRead == 0 && allowZeroAtStart)
-                        return 0;
-                    throw new IOException("Pipe bir okuma ORTASINDA (kısmi veri sonrası) kapandı.");
+                    if (_end == 0) return true;
+                    throw new PluginWorkerDisconnectedException("Pipe bir frame'in ORTASINDA koptu (worker beklenmedik şekilde öldü).");
                 }
-                totalRead += n;
+                _end += n;
             }
-            return totalRead;
+            return false;
         }
     }
 }

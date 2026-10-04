@@ -20,6 +20,15 @@ namespace DSO.Core.Evoker.Plugins.Management
         public int StartupTimeoutMs { get; init; } = 15000;
         public bool NotifyOnCrash { get; init; } = true;
         public string? CrashLogFilePath { get; init; }
+
+        /// <summary>
+        /// true: etkin (Enabled) plugin'ler InitializeAsync'te ve yeni kayıtta ARKA PLANDA hemen başlatılır - ilk
+        /// çağrı, worker'ın açılmasını (sandbox'ta ~50-100 ms: process + runtime + plugin yükleme) beklemez.
+        /// false (varsayılan): eski davranış, plugin ilk kullanımda (lazy) başlatılır. Arka plan başlatması
+        /// başarısız olursa sessizce geçilir (Trace'e yazılır); ilk gerçek çağrı yeniden dener ve hatayı görür.
+        /// Tek tek ısıtmak için: <see cref="PluginManager.WarmUpAsync"/>.
+        /// </summary>
+        public bool WarmStart { get; init; }
     }
 
     /// <summary>
@@ -38,7 +47,7 @@ namespace DSO.Core.Evoker.Plugins.Management
     /// </summary>
     public sealed class PluginManager : IAsyncDisposable
     {
-        private sealed class Slot
+        internal sealed class Slot
         {
             public Slot(PluginRegistration reg) => Registration = reg;
             public PluginRegistration Registration;
@@ -48,6 +57,7 @@ namespace DSO.Core.Evoker.Plugins.Management
             public IPluginBuilder? Inner;
             public int Version;
             public SwitchablePluginBuilder? Proxy;
+            public volatile bool Removed; // UnregisterAsync sonrası - proxy'nin hızlı yolu bunu görür
             public bool? LastUnloadReleased;
             public DateTime? LastCrashUtc;
             public string? LastCrashReason;
@@ -76,7 +86,31 @@ namespace DSO.Core.Evoker.Plugins.Management
             foreach (var reg in await _store.LoadAsync().ConfigureAwait(false))
                 _slots[reg.Id] = new Slot(reg.Clone());
             _initialized = true;
+            if (_options.WarmStart)
+                foreach (var id in _slots.Keys) WarmUpInBackground(id);
         }
+
+        /// <summary>
+        /// Plugin'i (henüz başlamadıysa) şimdi başlatır - ilk çağrının başlatma gecikmesini önceden ödemek için.
+        /// true = çalışıyor; false = başlatılamadı (devre dışı / hata - ayrıntı Status'ta ve ilk çağrıda).
+        /// </summary>
+        public async Task<bool> WarmUpAsync(string id)
+        {
+            try
+            {
+                var slot = GetSlot(id);
+                if (!slot.Registration.Enabled) return false;
+                await GetInnerAsync(id).ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[PluginManager] '{id}' ön başlatma başarısız: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void WarmUpInBackground(string id) => _ = Task.Run(() => WarmUpAsync(id));
 
         // ================= Kayıt / admin işlemleri =================
 
@@ -112,6 +146,7 @@ namespace DSO.Core.Evoker.Plugins.Management
                 return PluginRegistrationResult.Fail($"'{reg.Id}' adı aynı anda başka bir kayıtla eklendi - kayıt eklenmedi.", reg.Id);
 
             await SaveAsync().ConfigureAwait(false);
+            if (_options.WarmStart && reg.Enabled) WarmUpInBackground(reg.Id);
             int sameTypeCount = _slots.Values.Count(x =>
                 string.Equals(x.Registration.FilePath, reg.FilePath, StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(x.Registration.TypeFullName, reg.TypeFullName, StringComparison.OrdinalIgnoreCase));
@@ -224,6 +259,7 @@ namespace DSO.Core.Evoker.Plugins.Management
             try
             {
                 await StopCoreAsync(slot).ConfigureAwait(false);
+                slot.Removed = true;
                 _slots.TryRemove(id, out _);
             }
             finally { slot.Lock.Release(); }
@@ -277,7 +313,7 @@ namespace DSO.Core.Evoker.Plugins.Management
         {
             var slot = GetSlot(id);
             lock (slot)
-                return slot.Proxy ??= new SwitchablePluginBuilder(this, slot.Registration.Id, slot.Registration.DefaultTimeoutMs);
+                return slot.Proxy ??= new SwitchablePluginBuilder(this, slot, slot.Registration.Id, slot.Registration.DefaultTimeoutMs);
         }
 
         // --- proxy'nin kullandığı iç yüzey ---
@@ -296,6 +332,7 @@ namespace DSO.Core.Evoker.Plugins.Management
             try
             {
                 if (slot.Inner != null) return slot.Inner;
+                if (_disposed) throw new ObjectDisposedException(nameof(PluginManager));
                 if (!slot.Registration.Enabled)
                     throw new InvalidOperationException($"[PluginManager] '{id}' devre dışı (Enabled=false).");
                 await StartCoreAsync(slot).ConfigureAwait(false);
@@ -441,8 +478,11 @@ namespace DSO.Core.Evoker.Plugins.Management
             finally { _saveLock.Release(); }
         }
 
+        private volatile bool _disposed;
+
         public async ValueTask DisposeAsync()
         {
+            _disposed = true; // arka plan ısıtması (WarmStart) dispose'dan sonra yeni worker açmasın
             foreach (var slot in _slots.Values)
             {
                 await slot.Lock.WaitAsync().ConfigureAwait(false);

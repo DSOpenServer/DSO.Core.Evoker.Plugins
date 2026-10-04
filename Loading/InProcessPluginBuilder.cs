@@ -38,18 +38,63 @@ namespace DSO.Core.Evoker.Plugins.Loading
         public int? DefaultTimeoutMs { get; set; }
 
         // --- Metot çağırma ---
+        // PERFORMANS: her (metot adı, argüman tip imzası) için BİR KEZ bir "çağrı planı" çıkarılır: hangi metot,
+        // dönüş şekli (void / senkron / Task / Task<T>), hangi argümanların parametre tipine çevrilmesi gerektiği
+        // (enum / host DTO'su -> plugin tipi) ve derlenmiş invoker. Sonraki çağrılar: plan (önce son kullanılan,
+        // sonra sözlük) + gerekiyorsa argüman dönüşümü + derlenmiş delegate. Senkron metotlar async/Task
+        // katmanına HİÇ girmez (eskiden Invoke = InvokeAsync'in bloklanmış hali idi).
+        // Davranış (metot seçimi, dönüşümler, hata sözleşmesi, timeout) önceki ile birebir aynı.
 
-        public async Task<object?> InvokeAsync(string methodName, params object?[] args)
-            => await RunAsync(methodName, () => Builder.InvokeDynamicAsync(methodName, PrepareArgs(methodName, args ?? Array.Empty<object?>()))).ConfigureAwait(false);
+        public object? Invoke(string methodName, params object?[] args)
+        {
+            args ??= Array.Empty<object?>();
+            var plan = GetPlan(methodName, args);
+            return plan.IsSync ? CallSync(plan, methodName, args) : Sync(InvokeAsync(methodName, args));
+        }
 
-        public async Task<T?> InvokeAsync<T>(string methodName, params object?[] args)
-            => (T?)WireValueCodec.ConvertTo(await InvokeAsync(methodName, args).ConfigureAwait(false), typeof(T));
+        public T? Invoke<T>(string methodName, params object?[] args)
+        {
+            args ??= Array.Empty<object?>();
+            var plan = GetPlan(methodName, args);
+            return plan.IsSync ? ConvertResult<T>(CallSync(plan, methodName, args)) : Sync(InvokeAsync<T>(methodName, args));
+        }
+
+        public void Execute(string methodName, params object?[] args) => Invoke(methodName, args);
+
+        public Task<object?> InvokeAsync(string methodName, params object?[] args)
+        {
+            args ??= Array.Empty<object?>();
+            try
+            {
+                var plan = GetPlan(methodName, args);
+                return plan.IsSync ? Task.FromResult(CallSync(plan, methodName, args)) : RunTaskAsync(plan, methodName, args);
+            }
+            catch (Exception ex) { return Task.FromException<object?>(ex); }
+        }
+
+        public Task<T?> InvokeAsync<T>(string methodName, params object?[] args)
+        {
+            args ??= Array.Empty<object?>();
+            try
+            {
+                var plan = GetPlan(methodName, args);
+                return plan.IsSync
+                    ? Task.FromResult(ConvertResult<T>(CallSync(plan, methodName, args)))
+                    : ConvertAsync<T>(RunTaskAsync(plan, methodName, args));
+            }
+            catch (Exception ex) { return Task.FromException<T?>(ex); }
+        }
 
         public Task ExecuteAsync(string methodName, params object?[] args) => InvokeAsync(methodName, args);
 
-        public object? Invoke(string methodName, params object?[] args) => Sync(InvokeAsync(methodName, args));
-        public T? Invoke<T>(string methodName, params object?[] args) => Sync(InvokeAsync<T>(methodName, args));
-        public void Execute(string methodName, params object?[] args) => Sync(ExecuteAsync(methodName, args));
+        private static async Task<T?> ConvertAsync<T>(Task<object?> t) => ConvertResult<T>(await t.ConfigureAwait(false));
+
+        private static T? ConvertResult<T>(object? r)
+        {
+            if (r is T t) return t;
+            if (r == null) return default;
+            return (T?)WireValueCodec.ConvertTo(r, typeof(T));
+        }
 
         // --- Toplu çağrı (in-process'te IPC yok - sadece sıralı döngü, aynı hata sözleşmesiyle) ---
 
@@ -59,7 +104,14 @@ namespace DSO.Core.Evoker.Plugins.Loading
             var results = new T?[argsList.Count];
             for (int i = 0; i < argsList.Count; i++)
             {
-                try { results[i] = await InvokeAsync<T>(methodName, argsList[i] ?? Array.Empty<object?>()).ConfigureAwait(false); }
+                try
+                {
+                    var a = argsList[i] ?? Array.Empty<object?>();
+                    var plan = GetPlan(methodName, a);
+                    results[i] = plan.IsSync
+                        ? ConvertResult<T>(CallSync(plan, methodName, a))       // senkron: Task/await yok
+                        : await InvokeAsync<T>(methodName, a).ConfigureAwait(false);
+                }
                 catch (PluginInvocationException ex) when (ex.BatchIndex == null)
                 {
                     throw new PluginInvocationException(methodName, ex.RemoteExceptionType, ex.InnerException?.Message ?? ex.Message, ex.InnerException) { BatchIndex = i };
@@ -72,44 +124,70 @@ namespace DSO.Core.Evoker.Plugins.Loading
 
         // --- Property / field (doğrudan DynamicEntityAccessor - sıcak yol) ---
 
-        public T? GetValue<T>(string memberName) => Wrap(memberName, () =>
+        public T? GetValue<T>(string memberName)
         {
-            var memberType = MemberType(memberName);
-            if (IsDirectlyConvertible(memberType, typeof(T)))
-                return Builder.GetValue<T>(memberName); // sıcak yol: derlenmiş, boxing'siz getter
-            // T üyenin tipiyle ilgisiz (ör. plugin "Point", host kendi "PointDto"sunu istiyor) - sandbox ile
-            // AYNI kural: şekil eşlemesi (bkz. WireValueCodec.ConvertTo).
-            return (T?)WireValueCodec.ConvertTo(Builder.GetValue<object>(memberName), typeof(T));
-        });
+            try
+            {
+                if (IsDirectMember(memberName, typeof(T), forSet: false))
+                    return Builder.GetValue<T>(memberName); // sıcak yol: derlenmiş, boxing'siz getter
+                // T üyenin tipiyle ilgisiz (ör. plugin "Point", host kendi "PointDto"sunu istiyor) - sandbox ile
+                // AYNI kural: şekil eşlemesi (bkz. WireValueCodec.ConvertTo).
+                return (T?)WireValueCodec.ConvertTo(Builder.GetValue<object>(memberName), typeof(T));
+            }
+            catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(memberName, ex); }
+        }
 
-        public void SetValue<T>(string memberName, T value) => Wrap<object?>(memberName, () =>
+        public void SetValue<T>(string memberName, T value)
         {
-            var memberType = MemberType(memberName);
-            if (value == null || IsDirectlyConvertible(typeof(T), memberType))
-                Builder.SetValue(memberName, value);
-            else
-                Builder.SetValue<object?>(memberName, WireValueCodec.ConvertTo(value, memberType));
-            return null;
-        });
+            try
+            {
+                if (value == null || IsDirectMember(memberName, typeof(T), forSet: true))
+                    Builder.SetValue(memberName, value);
+                else
+                    Builder.SetValue<object?>(memberName, WireValueCodec.ConvertTo(value, MemberType(memberName)));
+            }
+            catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(memberName, ex); }
+        }
 
-        public Task<T?> GetValueAsync<T>(string memberName) => Task.FromResult(GetValue<T>(memberName));
+        public Task<T?> GetValueAsync<T>(string memberName)
+        {
+            try { return Task.FromResult(GetValue<T>(memberName)); }
+            catch (Exception ex) { return Task.FromException<T?>(ex); }
+        }
 
         public Task SetValueAsync<T>(string memberName, T value)
         {
-            SetValue(memberName, value);
-            return Task.CompletedTask;
+            try { SetValue(memberName, value); return Task.CompletedTask; }
+            catch (Exception ex) { return Task.FromException(ex); }
+        }
+
+        // (üye adı, istenen tip, get/set) -> Expression.Convert doğrudan yapabiliyor mu. Her çağrıda üye tipini
+        // bulup karşılaştırmak yerine bir kez hesaplanır.
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, Type, bool), bool> _directMembers = new();
+
+        private bool IsDirectMember(string memberName, Type t, bool forSet)
+        {
+            if (_directMembers.TryGetValue((memberName, t, forSet), out var d)) return d;
+            var mt = MemberType(memberName);
+            d = forSet ? IsDirectlyConvertible(t, mt) : IsDirectlyConvertible(mt, t);
+            _directMembers.TryAdd((memberName, t, forSet), d);
+            return d;
         }
 
         // --- Delegate'ler ---
 
         public Func<object?[], T?> GetFunc<T>(string methodName, object?[]? sampleArgs = null)
         {
-            // Senkron dönüşlü metot: EvokerBuilder'ın derlenmiş delegate'i DOĞRUDAN (sıfır ek katman).
+            // Senkron dönüşlü metot: EvokerBuilder'ın derlenmiş delegate'i doğrudan (sadece hata sarmalayıcısı).
             // Task/Task<T> dönüşlü metot: EvokerBuilder.GetFunc<T> Task'ı T'ye çeviremez -> bekleyen sarmalayıcı.
             if (!ReturnsTask(methodName, sampleArgs))
             {
                 var direct = Builder.GetFunc<T>(methodName, ToObjArray(sampleArgs));
-                return args => Wrap(methodName, () => direct(ToObjArray(args)!));
+                return args =>
+                {
+                    try { return direct((object[])(args ?? Array.Empty<object?>())); }
+                    catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
+                };
             }
             var f = GetFuncAsync<T>(methodName, sampleArgs);
             return args => Sync(f(args));
@@ -120,7 +198,11 @@ namespace DSO.Core.Evoker.Plugins.Loading
             if (!ReturnsTask(methodName, sampleArgs))
             {
                 var direct = Builder.GetAction(methodName, ToObjArray(sampleArgs));
-                return args => Wrap<object?>(methodName, () => { direct(ToObjArray(args)!); return null; });
+                return args =>
+                {
+                    try { direct((object[])(args ?? Array.Empty<object?>())); }
+                    catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
+                };
             }
             // EvokerBuilder.GetAction Task döndüren metodu BEKLEMEZ (fire-and-forget olurdu) - burada bekleniyor.
             var a = GetActionAsync(methodName, sampleArgs);
@@ -132,6 +214,95 @@ namespace DSO.Core.Evoker.Plugins.Loading
 
         public Func<object?[], Task> GetActionAsync(string methodName, object?[]? sampleArgs = null)
             => args => ExecuteAsync(methodName, args);
+
+        // --- Tipli delegate'ler ---
+        // Önce EvokerBuilder'ın boxing'siz derlenmiş delegate'i denenir (sadece hata sarmalayıcısı eklenir). Tipler
+        // doğrudan dönüştürülemiyorsa (host DTO'su ↔ plugin tipi) ya da metot Task döndürüyorsa, Invoke ile aynı
+        // kurallarla (argüman dönüşümü, Task bekleme, sonuç eşleme) çalışan genel yola düşülür.
+
+        public Func<TResult?> GetTypedFunc<TResult>(string methodName)
+        {
+            var f = TryTyped(methodName, Type.EmptyTypes, () => Builder.GetTypedFunc<TResult>(methodName));
+            if (f == null) return PluginTypedDelegates.Func(PerCall<TResult>(methodName));
+            return () => { try { return f(); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Func<T1, TResult?> GetTypedFunc<T1, TResult>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1) }, () => Builder.GetTypedFunc<T1, TResult>(methodName));
+            if (f == null) return PluginTypedDelegates.Func<T1, TResult>(PerCall<TResult>(methodName));
+            return a => { try { return f(a); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Func<T1, T2, TResult?> GetTypedFunc<T1, T2, TResult>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2) }, () => Builder.GetTypedFunc<T1, T2, TResult>(methodName));
+            if (f == null) return PluginTypedDelegates.Func<T1, T2, TResult>(PerCall<TResult>(methodName));
+            return (a, b) => { try { return f(a, b); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Func<T1, T2, T3, TResult?> GetTypedFunc<T1, T2, T3, TResult>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, () => Builder.GetTypedFunc<T1, T2, T3, TResult>(methodName));
+            if (f == null) return PluginTypedDelegates.Func<T1, T2, T3, TResult>(PerCall<TResult>(methodName));
+            return (a, b, c) => { try { return f(a, b, c); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Func<T1, T2, T3, T4, TResult?> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, () => Builder.GetTypedFunc<T1, T2, T3, T4, TResult>(methodName));
+            if (f == null) return PluginTypedDelegates.Func<T1, T2, T3, T4, TResult>(PerCall<TResult>(methodName));
+            return (a, b, c, d) => { try { return f(a, b, c, d); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Action GetTypedAction(string methodName)
+        {
+            var f = TryTyped(methodName, Type.EmptyTypes, () => Builder.GetTypedAction(methodName));
+            if (f == null) return PluginTypedDelegates.Action(PerCallAction(methodName));
+            return () => { try { f(); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Action<T1> GetTypedAction<T1>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1) }, () => Builder.GetTypedAction<T1>(methodName));
+            if (f == null) return PluginTypedDelegates.Action<T1>(PerCallAction(methodName));
+            return a => { try { f(a); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2) }, () => Builder.GetTypedAction<T1, T2>(methodName));
+            if (f == null) return PluginTypedDelegates.Action<T1, T2>(PerCallAction(methodName));
+            return (a, b) => { try { f(a, b); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, () => Builder.GetTypedAction<T1, T2, T3>(methodName));
+            if (f == null) return PluginTypedDelegates.Action<T1, T2, T3>(PerCallAction(methodName));
+            return (a, b, c) => { try { f(a, b, c); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName)
+        {
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, () => Builder.GetTypedAction<T1, T2, T3, T4>(methodName));
+            if (f == null) return PluginTypedDelegates.Action<T1, T2, T3, T4>(PerCallAction(methodName));
+            return (a, b, c, d) => { try { f(a, b, c, d); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
+        }
+
+        // Derlenmiş tipli delegate kurulabiliyor mu? Metot Task döndürüyorsa (beklenmesi gerekir), tip dönüşümü
+        // yoksa (InvalidCastException) ya da void metot için GetTypedFunc istendiyse null -> genel yol.
+        // "Metot yok" gibi çağıran hataları olduğu gibi fırlar.
+        private D? TryTyped<D>(string methodName, Type[] argTypes, Func<D> build) where D : Delegate
+        {
+            if (typeof(Task).IsAssignableFrom(Builder.FindMethodByTypes(methodName, argTypes).ReturnType)) return null;
+            try { return build(); }
+            catch (InvalidCastException) { return null; }
+            catch (InvalidOperationException) { return null; }
+        }
+
+        private Func<object?[], T?> PerCall<T>(string methodName) => args => Invoke<T>(methodName, args);
+        private Action<object?[]> PerCallAction(string methodName) => args => Execute(methodName, args);
 
         // --- Event'ler ---
 
@@ -221,8 +392,9 @@ namespace DSO.Core.Evoker.Plugins.Loading
         // Sandbox'taki worker ile AYNI kural: metot adı + argüman sayısıyla TEK aday varsa, parametresine
         // atanamayan enum/sayısal ya da Complex (host DTO'su) argümanları parametre tipine çevir.
         // Birden fazla overload varsa DOKUNMA - seçimi EvokerBuilder argümanların gerçek tiplerine göre yapar.
-        private object?[] PrepareArgs(string methodName, object?[] args)
+        private object?[] PrepareArgs(string methodName, object?[] args, out Type?[]? convertTo)
         {
+            convertTo = null;
             var ps = _uniqueSignatures.GetOrAdd((methodName, args.Length), key =>
             {
                 var c = Builder.FindMethodCandidates(key.Item1, key.Item2);
@@ -241,6 +413,7 @@ namespace DSO.Core.Evoker.Plugins.Loading
                 if (!enumTarget && !complexArg) continue;
                 copy ??= (object?[])args.Clone();
                 copy[i] = WireValueCodec.ConvertTo(a, pt);
+                (convertTo ??= new Type?[args.Length])[i] = pt;
             }
             return copy ?? args;
         }
@@ -253,11 +426,100 @@ namespace DSO.Core.Evoker.Plugins.Loading
 
         private static object[]? ToObjArray(object?[]? args) => args == null ? null : args.Select(a => a!).ToArray();
 
-        private async Task<object?> RunAsync(string methodName, Func<Task<object?>> call)
+        // --- Çağrı planı ---
+
+        private sealed class CallPlan
         {
-            Task<object?> task;
-            try { task = call(); }
+            public string MethodName = "";
+            public ArgTypeKey Key;
+            public bool IsSync;                       // void ya da senkron dönüş (Task değil)
+            public bool IsTaskOfT;                    // Task<T> (sonuç okunacak)
+            public Type?[]? ConvertTo;                // null = dönüşüm yok; aksi halde i. argüman bu tipe çevrilir (null eleman = dokunma)
+            public Func<object[], object?> Call = null!;
+            public Func<Task, object?>? TaskResult;
+        }
+
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, ArgTypeKey), CallPlan> _plans = new();
+        private CallPlan? _lastPlan;
+
+        private CallPlan GetPlan(string methodName, object?[] args)
+        {
+            var key = ArgTypeKey.From(args);
+            var last = _lastPlan;
+            if (last != null && last.Key.Equals(key) && string.Equals(last.MethodName, methodName, StringComparison.Ordinal))
+                return last;
+            if (!_plans.TryGetValue((methodName, key), out var plan))
+            {
+                try { plan = _plans.GetOrAdd((methodName, key), BuildPlan(methodName, args, key)); }
+                catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
+            }
+            _lastPlan = plan;
+            return plan;
+        }
+
+        private CallPlan BuildPlan(string methodName, object?[] args, ArgTypeKey key)
+        {
+            if (string.IsNullOrWhiteSpace(methodName)) throw new ArgumentException("methodName boş olamaz.", nameof(methodName));
+
+            // Hangi argümanların dönüştürüleceği (sandbox'taki worker ile AYNI kural, bkz. PrepareArgs). Karar
+            // sadece argümanların TİPLERİNE bağlı - aynı imzalı sonraki çağrılarda aynı kalır.
+            var prepared = PrepareArgs(methodName, args, out var convertTo);
+            var method = Builder.FindMethod(methodName, prepared);
+            var rt = method.ReturnType;
+            var sample = (object[])prepared;
+
+            var plan = new CallPlan { MethodName = methodName, Key = key, ConvertTo = convertTo };
+            if (rt == typeof(void))
+            {
+                var act = Builder.GetAction(methodName, sample);
+                plan.Call = a => { act(a); return null; };
+                plan.IsSync = true;
+            }
+            else
+            {
+                plan.Call = Builder.GetFunc<object>(methodName, sample)!;
+                plan.IsSync = !typeof(Task).IsAssignableFrom(rt);
+                if (!plan.IsSync && rt.IsGenericType && rt.GetGenericTypeDefinition() == typeof(Task<>))
+                {
+                    plan.IsTaskOfT = true;
+                    var p = System.Linq.Expressions.Expression.Parameter(typeof(Task), "t");
+                    plan.TaskResult = System.Linq.Expressions.Expression.Lambda<Func<Task, object?>>(
+                        System.Linq.Expressions.Expression.Convert(
+                            System.Linq.Expressions.Expression.Property(System.Linq.Expressions.Expression.Convert(p, rt), "Result"),
+                            typeof(object)), p).Compile();
+                }
+            }
+            return plan;
+        }
+
+        private object[] Prepare(CallPlan plan, string methodName, object?[] args)
+        {
+            var conv = plan.ConvertTo;
+            if (conv == null) return (object[])args;
+            try
+            {
+                var copy = (object?[])args.Clone();
+                for (int i = 0; i < conv.Length; i++)
+                    if (conv[i] != null && copy[i] != null) copy[i] = WireValueCodec.ConvertTo(copy[i], conv[i]!);
+                return (object[])copy;
+            }
             catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
+        }
+
+        private object? CallSync(CallPlan plan, string methodName, object?[] args)
+        {
+            var a = Prepare(plan, methodName, args);
+            try { return plan.Call(a); }
+            catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
+        }
+
+        private async Task<object?> RunTaskAsync(CallPlan plan, string methodName, object?[] args)
+        {
+            var a = Prepare(plan, methodName, args);
+            Task? task;
+            try { task = (Task?)plan.Call(a); }
+            catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
+            if (task == null) return null;
 
             if (DefaultTimeoutMs.HasValue)
             {
@@ -268,14 +530,12 @@ namespace DSO.Core.Evoker.Plugins.Loading
                         "(sadece bekleme bırakıldı, plugin kodu çalışmaya devam ediyor olabilir).");
             }
 
-            try { return await task.ConfigureAwait(false); }
+            try
+            {
+                await task.ConfigureAwait(false);
+                return plan.IsTaskOfT ? plan.TaskResult!(task) : null;
+            }
             catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); }
-        }
-
-        private static T Wrap<T>(string name, Func<T> call)
-        {
-            try { return call(); }
-            catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(name, ex); }
         }
 
         // Kullanıcı/çağıran hataları (boş isim, bağlanmamış builder) olduğu gibi kalır; geri kalan her şey

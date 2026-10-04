@@ -24,9 +24,15 @@ namespace DSO.Core.Evoker.Plugins.Management
         private readonly List<ProxySubscription> _subs = new();
         private int? _defaultTimeoutMs;
 
-        internal SwitchablePluginBuilder(PluginManager manager, string id, int? defaultTimeoutMs)
+        // PERFORMANS: manager'ın bu plugin'e ait slot'u doğrudan tutulur - her çağrıda id ile sözlük araması
+        // (Version + CurrentInner = 2 arama) yapılmaz. Kayıt silinirse (Removed) hızlı yol devre dışı kalır ve
+        // manager üzerinden gidilir (o da "kayıtlı değil" hatası verir - eski davranış).
+        private readonly PluginManager.Slot _slot;
+
+        internal SwitchablePluginBuilder(PluginManager manager, PluginManager.Slot slot, string id, int? defaultTimeoutMs)
         {
             _manager = manager;
+            _slot = slot;
             _id = id;
             _defaultTimeoutMs = defaultTimeoutMs;
         }
@@ -42,7 +48,7 @@ namespace DSO.Core.Evoker.Plugins.Management
             set
             {
                 _defaultTimeoutMs = value;
-                var inner = _manager.CurrentInner(_id);
+                var inner = CurrentInnerFast();
                 if (inner != null) inner.DefaultTimeoutMs = value;
             }
         }
@@ -53,13 +59,13 @@ namespace DSO.Core.Evoker.Plugins.Management
 
         private async Task<T> Run<T>(Func<IPluginBuilder, Task<T>> call)
         {
-            int version = _manager.Version(_id);
+            int version = CurrentVersion();
             var inner = await InnerAsync().ConfigureAwait(false);
             try
             {
                 return await call(inner).ConfigureAwait(false);
             }
-            catch (Exception) when (_manager.Version(_id) != version)
+            catch (Exception) when (CurrentVersion() != version)
             {
                 // Çağrı sürerken plugin başka moda geçti/yeniden başlatıldı ve eski taraf kapandı - yenisinde bir kez dene.
                 return await call(await InnerAsync().ConfigureAwait(false)).ConfigureAwait(false);
@@ -71,23 +77,82 @@ namespace DSO.Core.Evoker.Plugins.Management
         private static T Sync<T>(Task<T> t) => t.ConfigureAwait(false).GetAwaiter().GetResult();
         private static void Sync(Task t) => t.ConfigureAwait(false).GetAwaiter().GetResult();
 
+        // PERFORMANS (hızlı yol): plugin zaten çalışıyorsa (en yaygın durum) alttaki tarafa DOĞRUDAN gidilir -
+        // async sarmalayıcı / closure yok. Senkron çağrılar senkron kalır (eskiden async yolun bloklanmış haliydi).
+        // Geçiş anında hata alan çağrı, eskisi gibi, yeni tarafta bir kez tekrar denenir.
+        private int CurrentVersion() => _slot.Removed ? _manager.Version(_id) : Volatile.Read(ref _slot.Version);
+        private IPluginBuilder? CurrentInnerFast() => _slot.Removed ? _manager.CurrentInner(_id) : _slot.Inner;
+
+        private IPluginBuilder InnerSync() => CurrentInnerFast() ?? Sync(InnerAsync());
+
+        private Task<T> RunFast<T>(Func<IPluginBuilder, Task<T>> call)
+        {
+            int version = CurrentVersion();
+            var inner = CurrentInnerFast();
+            if (inner == null) return Run(call);
+            Task<T> task;
+            try { task = call(inner); }
+            catch (Exception) when (CurrentVersion() != version) { return Run(call); }
+            return task.IsCompletedSuccessfully ? task : AwaitWithRetry(task, version, call);
+        }
+
+        private async Task<T> AwaitWithRetry<T>(Task<T> task, int version, Func<IPluginBuilder, Task<T>> call)
+        {
+            try { return await task.ConfigureAwait(false); }
+            catch (Exception) when (CurrentVersion() != version)
+            {
+                return await call(await InnerAsync().ConfigureAwait(false)).ConfigureAwait(false);
+            }
+        }
+
         // --- Metot çağırma ---
-        public Task<object?> InvokeAsync(string methodName, params object?[] args) => Run(b => b.InvokeAsync(methodName, args));
-        public Task<T?> InvokeAsync<T>(string methodName, params object?[] args) => Run(b => b.InvokeAsync<T>(methodName, args));
-        public Task ExecuteAsync(string methodName, params object?[] args) => Run(b => b.ExecuteAsync(methodName, args));
-        public object? Invoke(string methodName, params object?[] args) => Sync(InvokeAsync(methodName, args));
-        public T? Invoke<T>(string methodName, params object?[] args) => Sync(InvokeAsync<T>(methodName, args));
-        public void Execute(string methodName, params object?[] args) => Sync(ExecuteAsync(methodName, args));
+        public Task<object?> InvokeAsync(string methodName, params object?[] args) => RunFast(b => b.InvokeAsync(methodName, args));
+        public Task<T?> InvokeAsync<T>(string methodName, params object?[] args) => RunFast(b => b.InvokeAsync<T>(methodName, args));
+        // Execute*: sonuç DECODE edilmez (sandbox'ta host'ta çözülemeyen bir dönüş tipi olabilir) - alttakinin Execute'u.
+        public Task ExecuteAsync(string methodName, params object?[] args) => RunFast(async b => { await b.ExecuteAsync(methodName, args).ConfigureAwait(false); return (object?)null; });
+
+        public object? Invoke(string methodName, params object?[] args)
+        {
+            int version = CurrentVersion();
+            try { return InnerSync().Invoke(methodName, args); }
+            catch (Exception) when (CurrentVersion() != version) { return InnerSync().Invoke(methodName, args); }
+        }
+
+        public T? Invoke<T>(string methodName, params object?[] args)
+        {
+            int version = CurrentVersion();
+            try { return InnerSync().Invoke<T>(methodName, args); }
+            catch (Exception) when (CurrentVersion() != version) { return InnerSync().Invoke<T>(methodName, args); }
+        }
+
+        public void Execute(string methodName, params object?[] args)
+        {
+            int version = CurrentVersion();
+            try { InnerSync().Execute(methodName, args); }
+            catch (Exception) when (CurrentVersion() != version) { InnerSync().Execute(methodName, args); }
+        }
 
         // --- Toplu ---
         public Task<T?[]> InvokeBatchAsync<T>(string methodName, IReadOnlyList<object?[]> argsList) => Run(b => b.InvokeBatchAsync<T>(methodName, argsList));
         public Task ExecuteBatchAsync(string methodName, IReadOnlyList<object?[]> argsList) => Run(b => b.ExecuteBatchAsync(methodName, argsList));
 
         // --- Property / field ---
-        public Task<T?> GetValueAsync<T>(string memberName) => Run(b => b.GetValueAsync<T>(memberName));
+        public Task<T?> GetValueAsync<T>(string memberName) => RunFast(b => b.GetValueAsync<T>(memberName));
         public Task SetValueAsync<T>(string memberName, T value) => Run(b => b.SetValueAsync(memberName, value));
-        public T? GetValue<T>(string memberName) => Sync(GetValueAsync<T>(memberName));
-        public void SetValue<T>(string memberName, T value) => Sync(SetValueAsync(memberName, value));
+
+        public T? GetValue<T>(string memberName)
+        {
+            int version = CurrentVersion();
+            try { return InnerSync().GetValue<T>(memberName); }
+            catch (Exception) when (CurrentVersion() != version) { return InnerSync().GetValue<T>(memberName); }
+        }
+
+        public void SetValue<T>(string memberName, T value)
+        {
+            int version = CurrentVersion();
+            try { InnerSync().SetValue(memberName, value); }
+            catch (Exception) when (CurrentVersion() != version) { InnerSync().SetValue(memberName, value); }
+        }
 
         // --- Delegate'ler: alttaki tarafın delegate'i önbellekte tutulur; taraf değişince (Version) yeniden alınır ---
         // Önbelleklenen alt-taraf delegate'i bir "slot"ta durur; proxy slot'ları ZAYIF referansla tanır ve geçişte
@@ -112,12 +177,12 @@ namespace DSO.Core.Evoker.Plugins.Management
             var slot = NewSlot();
             return args =>
             {
-                int cur = _manager.Version(_id);
+                int cur = CurrentVersion();
                 if (slot.Cached is not Func<object?[], T?> f || slot.Version != cur)
                 {
-                    f = Sync(InnerAsync()).GetFunc<T>(methodName, sampleArgs);
+                    f = InnerSync().GetFunc<T>(methodName, sampleArgs);
                     slot.Cached = f;
-                    slot.Version = _manager.Version(_id);
+                    slot.Version = CurrentVersion();
                 }
                 return f(args);
             };
@@ -128,12 +193,12 @@ namespace DSO.Core.Evoker.Plugins.Management
             var slot = NewSlot();
             return args =>
             {
-                int cur = _manager.Version(_id);
+                int cur = CurrentVersion();
                 if (slot.Cached is not Action<object?[]> a || slot.Version != cur)
                 {
-                    a = Sync(InnerAsync()).GetAction(methodName, sampleArgs);
+                    a = InnerSync().GetAction(methodName, sampleArgs);
                     slot.Cached = a;
-                    slot.Version = _manager.Version(_id);
+                    slot.Version = CurrentVersion();
                 }
                 a(args);
             };
@@ -141,6 +206,43 @@ namespace DSO.Core.Evoker.Plugins.Management
 
         public Func<object?[], Task<T?>> GetFuncAsync<T>(string methodName, object?[]? sampleArgs = null)
             => args => InvokeAsync<T>(methodName, args);
+
+        // Tipli delegate'ler: GetFunc ile aynı slot mekanizması - alttaki tarafın (in-process'te boxing'siz) tipli
+        // delegate'i önbellekte; taraf değişince bir sonraki çağrıda yeniden alınır.
+        private Func<TDel> TypedSlot<TDel>(Func<IPluginBuilder, TDel> get) where TDel : Delegate
+        {
+            var slot = NewSlot();
+            return () =>
+            {
+                int cur = CurrentVersion();
+                if (slot.Cached is TDel d && slot.Version == cur) return d;
+                d = get(InnerSync());
+                slot.Cached = d;
+                slot.Version = cur;
+                return d;
+            };
+        }
+
+        public Func<TResult?> GetTypedFunc<TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedFunc<TResult>(methodName)); return () => s()(); }
+        public Func<T1, TResult?> GetTypedFunc<T1, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedFunc<T1, TResult>(methodName)); return a => s()(a); }
+        public Func<T1, T2, TResult?> GetTypedFunc<T1, T2, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedFunc<T1, T2, TResult>(methodName)); return (a, c) => s()(a, c); }
+        public Func<T1, T2, T3, TResult?> GetTypedFunc<T1, T2, T3, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedFunc<T1, T2, T3, TResult>(methodName)); return (a, c, d) => s()(a, c, d); }
+        public Func<T1, T2, T3, T4, TResult?> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedFunc<T1, T2, T3, T4, TResult>(methodName)); return (a, c, d, e) => s()(a, c, d, e); }
+        public Action GetTypedAction(string methodName)
+        { var s = TypedSlot(b => b.GetTypedAction(methodName)); return () => s()(); }
+        public Action<T1> GetTypedAction<T1>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedAction<T1>(methodName)); return a => s()(a); }
+        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedAction<T1, T2>(methodName)); return (a, c) => s()(a, c); }
+        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedAction<T1, T2, T3>(methodName)); return (a, c, d) => s()(a, c, d); }
+        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName)
+        { var s = TypedSlot(b => b.GetTypedAction<T1, T2, T3, T4>(methodName)); return (a, c, d, e) => s()(a, c, d, e); }
 
         public Func<object?[], Task> GetActionAsync(string methodName, object?[]? sampleArgs = null)
             => args => ExecuteAsync(methodName, args);

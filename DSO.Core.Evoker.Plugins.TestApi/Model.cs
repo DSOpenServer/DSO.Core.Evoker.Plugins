@@ -908,19 +908,18 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
         static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
         static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+        static string TypeName = "TestPlugin.SamplePlugin";
+
+        // IPluginBuilder parite testi: AYNI senaryo gövdesi (RunScenarioAsync) hem sandbox (ayrı worker process,
+        // IPC) hem in-process (doğrudan EvokerBuilder) implementasyonuna karşı çalıştırılır. İkisi aynı sonucu
+        // vermeli - uygulama kodu IPluginBuilder'a bir kez yazılır, plugin nerede çalışırsa çalışsın değişmez.
+        //
+        // Kullanım: dotnet run -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
+        // NOT: Bu proje SamplePlugin'e derleme zamanı referans VERMİYOR - host plugin tiplerini (Point, Level)
+        // bilmiyor; kendi PointDto'sunu ve int'i kullanıyor (gerçek senaryo).
 
         public static async Task TestParite()
         {
-            // IPluginBuilder parite testi: AYNI senaryo gövdesi (RunScenarioAsync) hem sandbox (ayrı worker process,
-            // IPC) hem in-process (doğrudan EvokerBuilder) implementasyonuna karşı çalıştırılır. İkisi aynı sonucu
-            // vermeli - uygulama kodu IPluginBuilder'a bir kez yazılır, plugin nerede çalışırsa çalışsın değişmez.
-            //
-            // Kullanım: dotnet run -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
-            // NOT: Bu proje SamplePlugin'e derleme zamanı referans VERMİYOR - host plugin tiplerini (Point, Level)
-            // bilmiyor; kendi PointDto'sunu ve int'i kullanıyor (gerçek senaryo).
-
-            const string TypeName = "TestPlugin.SamplePlugin";
-
             if (!PreflightSamplePlugin(dllPath))
             {
                 Console.WriteLine(2);
@@ -1055,6 +1054,29 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 var doAsyncFn = b.GetActionAsync("DoAsyncWork", new object?[] { 0 });
                 await doAsyncFn(new object?[] { 4 });
                 Check("GetActionAsync DoAsyncWork(4) -> field=40", b.GetValue<int>("LastVoidCallValue") == 40);
+
+                Console.WriteLine("-- Tipli delegate'ler (GetTypedFunc / GetTypedAction) --");
+                var tAdd = b.GetTypedFunc<int, int, int>("Add");
+                long tSum = 0;
+                for (int i = 0; i < 2000; i++) tSum += tAdd(i, 1);
+                Check("GetTypedFunc<int,int,int> Add x2000", tSum == Enumerable.Range(0, 2000).Sum(i => (long)i + 1));
+                Check("dönüş genişletme: GetTypedFunc<int,int,long> Add(2,3)=5L", b.GetTypedFunc<int, int, long>("Add")(2, 3) == 5L);
+                Check("Task<int> dönen metot bekleniyor: GetTypedFunc<int,int,int> AddAsync(4,5)=9", b.GetTypedFunc<int, int, int>("AddAsync")(4, 5) == 9);
+                Check("Complex argüman (host DTO): GetTypedFunc<PointDto,int> SumPoint", b.GetTypedFunc<PointDto, int>("SumPoint")(new PointDto { X = 2, Y = 3 }) == 5);
+                var tmp = b.GetTypedFunc<int, int, PointDto>("MakePoint")(7, 9);
+                Check("Complex dönüş (host DTO): GetTypedFunc<int,int,PointDto> MakePoint", tmp is { X: 7, Y: 9 });
+                Check("overload tipe göre: GetTypedFunc<string,string,string> Combine", b.GetTypedFunc<string, string, string>("Combine")("a", "b") == "a+b");
+                Check("static: GetTypedFunc<int,int> StaticTwice", b.GetTypedFunc<int, int>("StaticTwice")(21) == 42);
+                b.GetTypedAction<int>("DoSomething")(8);
+                Check("GetTypedAction<int> DoSomething(8) -> field=8", b.GetValue<int>("LastVoidCallValue") == 8);
+                b.GetTypedAction<int>("DoAsyncWork")(2);
+                Check("GetTypedAction Task dönen metot BEKLENİYOR -> field=20", b.GetValue<int>("LastVoidCallValue") == 20);
+                var tDiv = b.GetTypedFunc<int, int, int>("CheckedDivide");
+                await ExpectAsync<PluginInvocationException>("tipli delegate'te plugin hatası -> PluginInvocationException",
+                    () => { tDiv(1, 0); return Task.CompletedTask; }, ex => ex.RemoteExceptionType == typeof(DivideByZeroException).FullName);
+                Check("hatadan sonra aynı tipli delegate çalışıyor", tDiv(10, 2) == 5);
+                if (b.IncludeNonPublic)
+                    Check("private: GetTypedFunc<int,int,int> MultiplySecret(6,7)=42", b.GetTypedFunc<int, int, int>("MultiplySecret")(6, 7) == 42);
 
                 Console.WriteLine("-- Hatalar (iki modda AYNI exception tipleri) --");
                 await ExpectAsync<PluginInvocationException>("plugin exception -> PluginInvocationException",
@@ -1257,6 +1279,32 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 }
             }
 
+            // 5b) Derlenmiş şekil eşleyici (plugin tipi <-> host DTO): sonuç JSON yoluyla BİREBİR aynı olmalı
+            Console.WriteLine("\n===== ŞEKİL EŞLEME: derlenmiş eşleyici == JSON =====");
+            {
+                static string J(object? o) => JsonSerializer.Serialize(o);
+                static object? ViaJson(object v, Type t) => JsonSerializer.Deserialize(JsonSerializer.Serialize(v, v.GetType()), t);
+                void Same(string label, object src, Type target)
+                {
+                    object? fast = null, slow = null; string? fe = null, se = null;
+                    try { fast = WireValueCodec.ConvertTo(src, target); } catch (Exception ex) { fe = ex.GetType().Name; }
+                    try { slow = ViaJson(src, target); } catch (Exception ex) { se = ex.GetType().Name; }
+                    Check(label, fe == se && J(fast) == J(slow) && (fast == null || fast.GetType() == target), fe ?? J(fast));
+                }
+                Same("basit: X,Y", new MapSrcA { X = 1, Y = 2, Name = "a" }, typeof(MapDstA));
+                Same("eksik/fazla property + null string", new MapSrcA { X = 3, Name = null }, typeof(MapDstB));
+                Same("iç içe nesne", new MapSrcN { Id = 7, Inner = new MapSrcA { X = 4, Y = 5, Name = "i" } }, typeof(MapDstN));
+                Same("iç içe null", new MapSrcN { Id = 8, Inner = null }, typeof(MapDstN));
+                Same("tip uyuşmazlığı int->long (JSON'a düşer)", new MapSrcA { X = 9 }, typeof(MapDstLong));
+                Same("[JsonPropertyName] (JSON'a düşer)", new MapSrcA { X = 1, Y = 2 }, typeof(MapDstAttr));
+                Same("init-only hedef (JSON'a düşer)", new MapSrcA { X = 1, Y = 2 }, typeof(MapDstInit));
+                Same("liste property (JSON'a düşer)", new MapSrcList { Items = new() { 1, 2, 3 } }, typeof(MapDstList));
+                Same("struct hedef", new MapSrcA { X = 5, Y = 6 }, typeof(MapDstStruct));
+                Same("DateTime/decimal/Guid/enum aynı tip", new MapSrcMix { D = new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc), M = 1.25m, G = Guid.Parse("11111111-2222-3333-4444-555555555555"), L = DayOfWeek.Friday }, typeof(MapDstMix));
+                Same("yazılamaz hedef property atlanıyor", new MapSrcA { X = 1, Y = 2 }, typeof(MapDstReadOnly));
+                Same("büyük/küçük harf farklı ad (JSON eşlemez)", new MapSrcA { X = 1, Y = 2 }, typeof(MapDstLower));
+            }
+
             // 6) Promote: IPluginBuilder'a yazılmış kod sandbox -> in-process geçişinde DEĞİŞMEDEN çalışmalı
             Console.WriteLine("\n===== PROMOTE: aynı kod, sandbox'tan in-process'e =====");
             static int BusinessLogic(IPluginBuilder b) => b.Invoke<int>("Add", 20, 22) + b.GetValue<int>("ReadOnlyValue");
@@ -1296,7 +1344,6 @@ namespace DSO.Core.Evoker.Plugins.TestApi
 
         }
 
-
     }
 
     public static class PluginManagerTesti
@@ -1305,17 +1352,16 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
         static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
         static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+        static string TypeName = "TestPlugin.SamplePlugin";
+
+        // PluginManager testi: kayıt + kalıcılık (JSON), uygulamanın elindeki TEK IPluginBuilder'ın canlı mod
+        // geçişlerinde (sandbox <-> in-process) çalışmaya devam etmesi, event/GetFunc'ın geçişlerden sağ çıkması,
+        // in-process'ten çıkarken belleğin gerçekten boşaltılması, çökme bildirimi, geçersiz kayıt reddi, pool ayar kontrolü.
+        //
+        // Kullanım: dotnet run -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
 
         public static async Task PluginManagerTest()
         {
-            // PluginManager testi: kayıt + kalıcılık (JSON), uygulamanın elindeki TEK IPluginBuilder'ın canlı mod
-            // geçişlerinde (sandbox <-> in-process) çalışmaya devam etmesi, event/GetFunc'ın geçişlerden sağ çıkması,
-            // in-process'ten çıkarken belleğin gerçekten boşaltılması, çökme bildirimi, geçersiz kayıt reddi, pool ayar kontrolü.
-            //
-            // Kullanım: dotnet run -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
-
-            const string TypeName = "TestPlugin.SamplePlugin";
-
             if (!PreflightSamplePlugin(dllPath))
             {
                 Console.WriteLine(2);
@@ -1401,6 +1447,9 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Check("event (sandbox)", counterEvents.Count == 1);
             Check("GetFunc (sandbox)", add(new object?[] { 1, 1 }) == 2);
 
+            var tAdd = app.GetTypedFunc<int, int, int>("Add");
+            Check("tipli delegate (sandbox): tAdd(2,3)=5", tAdd(2, 3) == 5);
+
             Console.WriteLine("\n=== 3) Admin: Sandbox -> InProcess (canlı geçiş) ===");
             var modeChanges = new List<PluginExecutionMode>();
             mgr.ModeChanged += (_, m) => modeChanges.Add(m);
@@ -1409,6 +1458,7 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Check("mod InProcess, çalışıyor, worker yok", st.Mode == PluginExecutionMode.InProcess && st.IsRunning && st.ProcessId == null && !app.IsSandboxed);
             Check("AYNI builder nesnesi çalışıyor: Add(20,22)=42", app.Invoke<int>("Add", 20, 22) == 42);
             Check("AYNI GetFunc delegate'i yeni tarafa geçti", add(new object?[] { 5, 5 }) == 10);
+            Check("AYNI tipli delegate yeni tarafa (in-process, boxing'siz) geçti: tAdd(5,6)=11", tAdd(5, 6) == 11);
             Check("state sıfırlandı (yeni instance): Counter=0", app.GetValue<int>("Counter") == 0);
             app.Invoke("Increment");
             await WaitUntil(() => counterEvents.Count == 2);
@@ -1423,6 +1473,7 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Check("eski in-process kopya bellekten GERÇEKTEN boşaltıldı", st.LastUnloadReleasedMemory == true, st.LastUnloadReleasedMemory?.ToString() ?? "null");
             Check("builder çalışıyor", app.Invoke<int>("Add", 1, 2) == 3);
             Check("GetFunc çalışıyor", add(new object?[] { 3, 3 }) == 6);
+            Check("tipli delegate tekrar sandbox'ta çalışıyor: tAdd(7,8)=15", tAdd(7, 8) == 15);
             app.Invoke("Increment");
             await WaitUntil(() => counterEvents.Count == 3);
             Check("event aboneliği tekrar sandbox tarafında", counterEvents.Count == 3);
@@ -1480,6 +1531,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Check("tekrar etkin", app.Invoke<int>("Add", 2, 2) == 4);
             await mgr.UnregisterAsync("sample");
             Check("kayıt silindi, JSON'da yok", !mgr.Registrations.Any() && !File.ReadAllText(configPath).Contains("sample"));
+            await Expect<KeyNotFoundException>("kayıt silindikten sonra eski builder (async) -> KeyNotFoundException", () => app.InvokeAsync<int>("Add", 1, 1));
+            await Expect<KeyNotFoundException>("kayıt silindikten sonra eski builder (senkron) -> KeyNotFoundException", () => Task.FromResult(app.Invoke<int>("Add", 1, 1)));
 
             Console.WriteLine("\n=== 9) Pool: aynı plugin farklı ayarla istenirse net hata ===");
             await using (var pool = new PluginWorkerPool())
@@ -1493,6 +1546,32 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 await Expect<InvalidOperationException>("farklı includeNonPublic -> InvalidOperationException",
                     () => pool.GetOrStartAsync(dllPath, TypeName, o1, includeNonPublic: true));
             }
+
+            Console.WriteLine("\n=== 10) WarmStart: plugin ilk çağrıdan ÖNCE arka planda başlatılır ===");
+            string warmConfig = Path.Combine(Path.GetTempPath(), "dso-plugins-warm-" + Guid.NewGuid().ToString("N")[..6] + ".json");
+            await using (var warm = new PluginManager(new JsonFilePluginConfigStore(warmConfig), new PluginManagerOptions { HostPath = hostDllPath, NotifyOnCrash = false, WarmStart = true }))
+            {
+                await warm.InitializeAsync();
+                var wr = await warm.RegisterAsync(new PluginRegistration { Id = "warm", FilePath = dllPath, TypeFullName = TypeName });
+                Check("kayıt", wr.Success, wr.Message);
+                await WaitUntil(() => warm.GetStatus("warm").IsRunning);
+                Check("hiç çağrı yapılmadan worker çalışıyor (arka planda başladı)", warm.GetStatus("warm").IsRunning && warm.GetStatus("warm").ProcessId != null);
+                var sw1 = Stopwatch.StartNew();
+                int r = warm.Get("warm").Invoke<int>("Add", 1, 2);
+                Check("ilk çağrı başlatma beklemeden döndü", r == 3 && sw1.ElapsedMilliseconds < 250, $"{sw1.ElapsedMilliseconds} ms");
+                Check("WarmUpAsync (zaten çalışıyor) -> true", await warm.WarmUpAsync("warm"));
+                await warm.RegisterAsync(new PluginRegistration { Id = "kapali", FilePath = dllPath, TypeFullName = TypeName, Enabled = false });
+                await Task.Delay(300);
+                Check("Enabled=false kayıt ısıtılmıyor", !warm.GetStatus("kapali").IsRunning && !await warm.WarmUpAsync("kapali"));
+            }
+            // Yeni bir manager AYNI dosyayla açılınca (uygulama yeniden başladı) etkin plugin'ler InitializeAsync'te ısınır.
+            await using (var warm2 = new PluginManager(new JsonFilePluginConfigStore(warmConfig), new PluginManagerOptions { HostPath = hostDllPath, NotifyOnCrash = false, WarmStart = true }))
+            {
+                await warm2.InitializeAsync();
+                await WaitUntil(() => warm2.GetStatus("warm").IsRunning);
+                Check("yeniden açılışta InitializeAsync etkin plugin'i ısıttı", warm2.GetStatus("warm").IsRunning);
+            }
+            File.Delete(warmConfig);
 
             await mgr.DisposeAsync();
             await mgr2.DisposeAsync();
@@ -1522,7 +1601,6 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 Console.WriteLine("  testi o build çıktısındaki SamplePlugin.dll ile çalıştırın.");
                 return false;
             }
-
         }
     }
 
@@ -1531,21 +1609,19 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         static string PluginsFolderPath = Path.Combine(AppContext.BaseDirectory, "Plugins");
         static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
         static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
-        static string depV2 = Path.Combine(PluginsFolderPath, "depV2", "SampleDep.dll"); 
+        static string depV2 = Path.Combine(PluginsFolderPath, "depV2", "SampleDep.dll");
         static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+        static string TypeName = "TestPlugin.SamplePlugin";
+
+        // In-process plugin'in kendi AssemblyLoadContext'ine yüklenip GERÇEKTEN boşaltılabildiğini doğrular.
+        //
+        // Kullanım: dotnet run -- <SamplePlugin.dll yolu> [SampleDep v2 dll yolu (opsiyonel)]
+        //   SampleDep v2 üretmek için:  dotnet build SampleDep -c Release -p:DefineConstants=V2 -o depv2
+        //   (verilmezse sürüm-izolasyonu alt testi atlanır, diğerleri çalışır)
 
         public static async Task TestRun()
         {
-            // In-process plugin'in kendi AssemblyLoadContext'ine yüklenip GERÇEKTEN boşaltılabildiğini doğrular.
-            //
-            // Kullanım: dotnet run -- <SamplePlugin.dll yolu> [SampleDep v2 dll yolu (opsiyonel)]
-            //   SampleDep v2 üretmek için:  dotnet build SampleDep -c Release -p:DefineConstants=V2 -o depv2
-            //   (verilmezse sürüm-izolasyonu alt testi atlanır, diğerleri çalışır)
-
-            string sourceDll = dllPath; //Path.GetFullPath(args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli."));
-            //string? depV2 = args.Length > 1 ? Path.GetFullPath(args[1]) : null;
-            const string TypeName = "TestPlugin.SamplePlugin";
-
+            string sourceDll = dllPath;
             if (!PreflightSamplePlugin(sourceDll))
             {
                 Console.WriteLine(2);
@@ -1592,6 +1668,11 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 check("optional + küçük harf: optionaldemo(1)", b.Invoke<string>("optionaldemo", 1) == "1|5|x", "");
                 var add = b.GetFunc<int>("Add", new object?[] { 0, 0 });
                 check("GetFunc", add(new object?[] { 5, 5 }) == 10, "");
+                // Optimizasyon turunda eklenen cache'ler de plugin tiplerine referans tutar - unload'u ENGELLEMEMELİ:
+                check("tipli delegate (EvokerBuilder tipli cache'i)", b.GetTypedFunc<int, int, int>("Add")(2, 2) == 4, "");
+                check("Complex ARGÜMAN (derlenmiş şekil eşleyici host DTO -> plugin Point)", b.Invoke<int>("SumPoint", new PointDto { X = 1, Y = 2 }) == 3, "");
+                check("tipli Complex dönüş (eşleyici plugin Point -> host DTO)", b.GetTypedFunc<int, int, PointDto>("MakePoint")(5, 6) is { X: 5, Y: 6 }, "");
+                check("InvokeDynamicAsync Task<T> planı (derlenmiş sonuç okuyucu)", (int)(await loader.Builder!.InvokeDynamicAsync("AddAsync", new object?[] { 1, 1 }))! == 2, "");
                 int evt = 0;
                 using (loader.Builder!.AddEventHandler("CounterChanged", a => evt = (int)a[1]!))
                     b.Invoke("Increment");
@@ -1717,7 +1798,6 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
         static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
 
-
         // Performans karşılaştırması: aynı işlem (SamplePlugin.Add(int,int)) her katmandan çağrılır; çağrı başına süre
         // (ns/op) ve çağrı başına bellek ayırma (B/op) ölçülür. Ayrıca sandbox'a özgü senaryolar (paralellik, toplu
         // çağrı, büyük metin, complex nesne) ve başlatma maliyetleri.
@@ -1730,6 +1810,7 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         {
             string dll = dllPath; //Path.GetFullPath(args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli."));
             string host = hostDllPath; //Path.GetFullPath(args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli."));
+
             const string T = "TestPlugin.SamplePlugin";
             var results = new List<(string Group, string Name, double Ns, double Bytes, string Note)>();
 
@@ -1809,6 +1890,10 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Add("A", "A7 IPluginBuilder (in-process).InvokeAsync<int> (await)", await MeasureAsync(N / 2, async () => x = await ipb.InvokeAsync<int>("Add", x & 1023, 1)));
             var ipbFunc = ipb.GetFunc<int>("Add", new object?[] { 0, 0 });
             Add("A", "A8 IPluginBuilder (in-process).GetFunc<int>", Measure(N, () => x = ipbFunc(new object?[] { x & 1023, 1 })));
+            var ebTyped = eb.GetTypedFunc<int, int, int>("Add");
+            Add("A", "A10 EvokerBuilder.GetTypedFunc<int,int,int> (boxing yok)", Measure(N * 5, () => x = ebTyped(x & 1023, 1)));
+            var ipbTyped = ipb.GetTypedFunc<int, int, int>("Add");
+            Add("A", "A11 IPluginBuilder (in-process).GetTypedFunc<int,int,int>", Measure(N * 5, () => x = ipbTyped(x & 1023, 1)));
             var batchArgs = Enumerable.Range(0, 10_000).Select(i => new object?[] { i, 1 }).ToList();
             var rb = await MeasureAsync(20, async () => await ipb.InvokeBatchAsync<int>("Add", batchArgs));
             Add("A", "A9 IPluginBuilder (in-process).InvokeBatchAsync (çağrı başına)", (rb.ns / batchArgs.Count, rb.bytes / batchArgs.Count));
@@ -1824,7 +1909,7 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Add("B", "B6 IPluginBuilder (in-process).SetValue<int>", Measure(N, () => ipb.SetValue("Counter", x & 1023)));
 
             Console.WriteLine("\n=== C) Complex nesne (Point) - in-process ===");
-            Add("C", "C1 Invoke<PointDto>(\"MakePoint\") (plugin Point -> host DTO, JSON eşleme)", Measure(N / 10, () => ipb.Invoke<PointDto>("MakePoint", 1, 2)));
+            Add("C", "C1 Invoke<PointDto>(\"MakePoint\") (plugin Point -> host DTO, şekil eşleme)", Measure(N / 10, () => ipb.Invoke<PointDto>("MakePoint", 1, 2)));
             var dto = new PointDto { X = 2, Y = 3 };
             Add("C", "C2 Invoke<int>(\"SumPoint\", PointDto) (host DTO -> plugin Point)", Measure(N / 10, () => x = ipb.Invoke<int>("SumPoint", dto)));
 
@@ -1839,6 +1924,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             var proxyFunc = proxy.GetFunc<int>("Add", new object?[] { 0, 0 });
             Add("D", "D2 proxy.GetFunc<int>", Measure(N, () => x = proxyFunc(new object?[] { x & 1023, 1 })));
             Add("D", "D3 proxy.GetValue<int>", Measure(N / 2, () => x = proxy.GetValue<int>("Counter")));
+            var proxyTyped = proxy.GetTypedFunc<int, int, int>("Add");
+            Add("D", "D4 proxy.GetTypedFunc<int,int,int>", Measure(N * 2, () => x = proxyTyped(x & 1023, 1)));
 
             // =====================================================================================
             Console.WriteLine("\n=== E) Sandbox (ayrı worker process, named pipe) ===");
@@ -1860,6 +1947,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Add("E", "E7 sandbox SetValue<int>", Measure(S, () => sb.SetValue("Counter", x & 1023)));
             Add("E", "E8 sandbox Invoke<PointDto>(\"MakePoint\") (Complex dönüş)", Measure(S / 2, () => sb.Invoke<PointDto>("MakePoint", 1, 2)));
             Add("E", "E9 sandbox Invoke<int>(\"SumPoint\", PointDto) (Complex argüman)", Measure(S / 2, () => x = sb.Invoke<int>("SumPoint", dto)));
+            var sbTyped = sb.GetTypedFunc<int, int, int>("Add");
+            Add("E", "E11 sandbox GetTypedFunc<int,int,int>", Measure(S, () => x = sbTyped(x & 1023, 1)));
             string big = new string('x', 100_000);
             var rBig = Measure(300, () => sb.Invoke<string>("Greet", big, "Merhaba"));
             Add("E", "E10 sandbox Greet(100 KB metin) - gidiş + dönüş", rBig, $"≈ {200_000 / (rBig.ns / 1e9) / 1_048_576:0} MB/s");
@@ -1908,9 +1997,13 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             // Cache isabetini tekil bir host tipiyle ölçüyoruz.
             var rt = Measure(N, () => EvokerEngine.ResolveType("PointDto"));
             Console.WriteLine($"  EvokerEngine.ResolveType cache isabeti: {Fmt(rt.ns)} ({rt.bytes:0} B/op)");
+            string missName = "OlmayanTip_" + Guid.NewGuid().ToString("N");
             var missSw = Stopwatch.StartNew();
-            try { EvokerEngine.ResolveType("OlmayanTip_" + Guid.NewGuid().ToString("N")); } catch (TypeLoadException) { }
-            Console.WriteLine($"  EvokerEngine.ResolveType ıska (tüm assembly'leri tarar): {missSw.Elapsed.TotalMilliseconds:0.0} ms");
+            try { EvokerEngine.ResolveType(missName); } catch (TypeLoadException) { }
+            double firstMiss = missSw.Elapsed.TotalMilliseconds;
+            missSw.Restart();
+            try { EvokerEngine.ResolveType(missName); } catch (TypeLoadException) { }
+            Console.WriteLine($"  EvokerEngine.ResolveType ıska: ilk {firstMiss:0.0} ms (tüm assembly'leri tarar), aynı ad tekrar {missSw.Elapsed.TotalMilliseconds * 1000:0} µs (bulunamayan ad cache'i)");
 
             await loader.UnloadAsync();
             File.Delete(cfg);
@@ -1930,7 +2023,23 @@ namespace DSO.Core.Evoker.Plugins.TestApi
     }
 
     public sealed class Holder { public IPluginBuilder? Builder; }
+    public class MapSrcA { public int X { get; set; } public int Y { get; set; } public string? Name { get; set; } }
+    public class MapDstA { public int X { get; set; } public int Y { get; set; } public string? Name { get; set; } }
+    public class MapDstB { public int X { get; set; } public string? Name { get; set; } = "varsayilan"; public int Extra { get; set; } = 42; }
+    public class MapSrcN { public int Id { get; set; } public MapSrcA? Inner { get; set; } }
+    public class MapDstN { public int Id { get; set; } public MapDstA? Inner { get; set; } }
+    public class MapDstLong { public long X { get; set; } }
+    public class MapDstAttr { [System.Text.Json.Serialization.JsonPropertyName("Y")] public int X { get; set; } }
+    public class MapDstInit { public int X { get; init; } public int Y { get; set; } }
+    public class MapSrcList { public List<int> Items { get; set; } = new(); }
+    public class MapDstList { public List<int> Items { get; set; } = new(); }
+    public struct MapDstStruct { public int X { get; set; } public int Y { get; set; } }
+    public class MapSrcMix { public DateTime D { get; set; } public decimal M { get; set; } public Guid G { get; set; } public DayOfWeek L { get; set; } }
+    public class MapDstMix { public DateTime D { get; set; } public decimal M { get; set; } public Guid G { get; set; } public DayOfWeek L { get; set; } }
+    public class MapDstReadOnly { public int X { get; } = 77; public int Y { get; set; } }
+    public class MapDstLower { public int x { get; set; } public int Y { get; set; } }
 }
+
 
 
 
