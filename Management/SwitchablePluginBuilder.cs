@@ -223,26 +223,22 @@ namespace DSO.Core.Evoker.Plugins.Management
             };
         }
 
-        public Func<TResult?> GetTypedFunc<TResult>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedFunc<TResult>(methodName)); return () => s()(); }
-        public Func<T1, TResult?> GetTypedFunc<T1, TResult>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedFunc<T1, TResult>(methodName)); return a => s()(a); }
-        public Func<T1, T2, TResult?> GetTypedFunc<T1, T2, TResult>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedFunc<T1, T2, TResult>(methodName)); return (a, c) => s()(a, c); }
-        public Func<T1, T2, T3, TResult?> GetTypedFunc<T1, T2, T3, TResult>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedFunc<T1, T2, T3, TResult>(methodName)); return (a, c, d) => s()(a, c, d); }
-        public Func<T1, T2, T3, T4, TResult?> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedFunc<T1, T2, T3, T4, TResult>(methodName)); return (a, c, d, e) => s()(a, c, d, e); }
-        public Action GetTypedAction(string methodName)
-        { var s = TypedSlot(b => b.GetTypedAction(methodName)); return () => s()(); }
-        public Action<T1> GetTypedAction<T1>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedAction<T1>(methodName)); return a => s()(a); }
-        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedAction<T1, T2>(methodName)); return (a, c) => s()(a, c); }
-        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedAction<T1, T2, T3>(methodName)); return (a, c, d) => s()(a, c, d); }
-        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName)
-        { var s = TypedSlot(b => b.GetTypedAction<T1, T2, T3, T4>(methodName)); return (a, c, d, e) => s()(a, c, d, e); }
+        public Func<T1, TResult?> GetFunc<T1, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetFunc<T1, TResult>(methodName)); return a => s()(a); }
+        public Func<T1, T2, TResult?> GetFunc<T1, T2, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetFunc<T1, T2, TResult>(methodName)); return (a, c) => s()(a, c); }
+        public Func<T1, T2, T3, TResult?> GetFunc<T1, T2, T3, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetFunc<T1, T2, T3, TResult>(methodName)); return (a, c, d) => s()(a, c, d); }
+        public Func<T1, T2, T3, T4, TResult?> GetFunc<T1, T2, T3, T4, TResult>(string methodName)
+        { var s = TypedSlot(b => b.GetFunc<T1, T2, T3, T4, TResult>(methodName)); return (a, c, d, e) => s()(a, c, d, e); }
+        public Action<T1> GetAction<T1>(string methodName)
+        { var s = TypedSlot(b => b.GetAction<T1>(methodName)); return a => s()(a); }
+        public Action<T1, T2> GetAction<T1, T2>(string methodName)
+        { var s = TypedSlot(b => b.GetAction<T1, T2>(methodName)); return (a, c) => s()(a, c); }
+        public Action<T1, T2, T3> GetAction<T1, T2, T3>(string methodName)
+        { var s = TypedSlot(b => b.GetAction<T1, T2, T3>(methodName)); return (a, c, d) => s()(a, c, d); }
+        public Action<T1, T2, T3, T4> GetAction<T1, T2, T3, T4>(string methodName)
+        { var s = TypedSlot(b => b.GetAction<T1, T2, T3, T4>(methodName)); return (a, c, d, e) => s()(a, c, d, e); }
 
         public Func<object?[], Task> GetActionAsync(string methodName, object?[]? sampleArgs = null)
             => args => ExecuteAsync(methodName, args);

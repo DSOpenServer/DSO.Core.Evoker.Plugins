@@ -220,78 +220,64 @@ namespace DSO.Core.Evoker.Plugins.Loading
         // doğrudan dönüştürülemiyorsa (host DTO'su ↔ plugin tipi) ya da metot Task döndürüyorsa, Invoke ile aynı
         // kurallarla (argüman dönüşümü, Task bekleme, sonuç eşleme) çalışan genel yola düşülür.
 
-        public Func<TResult?> GetTypedFunc<TResult>(string methodName)
+        public Func<T1, TResult?> GetFunc<T1, TResult>(string methodName)
         {
-            var f = TryTyped(methodName, Type.EmptyTypes, () => Builder.GetTypedFunc<TResult>(methodName));
-            if (f == null) return PluginTypedDelegates.Func(PerCall<TResult>(methodName));
-            return () => { try { return f(); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
-        }
-
-        public Func<T1, TResult?> GetTypedFunc<T1, TResult>(string methodName)
-        {
-            var f = TryTyped(methodName, new[] { typeof(T1) }, () => Builder.GetTypedFunc<T1, TResult>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1) }, () => Builder.GetFunc<T1, TResult>(methodName));
             if (f == null) return PluginTypedDelegates.Func<T1, TResult>(PerCall<TResult>(methodName));
             return a => { try { return f(a); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Func<T1, T2, TResult?> GetTypedFunc<T1, T2, TResult>(string methodName)
+        public Func<T1, T2, TResult?> GetFunc<T1, T2, TResult>(string methodName)
         {
-            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2) }, () => Builder.GetTypedFunc<T1, T2, TResult>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2) }, () => Builder.GetFunc<T1, T2, TResult>(methodName));
             if (f == null) return PluginTypedDelegates.Func<T1, T2, TResult>(PerCall<TResult>(methodName));
             return (a, b) => { try { return f(a, b); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Func<T1, T2, T3, TResult?> GetTypedFunc<T1, T2, T3, TResult>(string methodName)
+        public Func<T1, T2, T3, TResult?> GetFunc<T1, T2, T3, TResult>(string methodName)
         {
-            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, () => Builder.GetTypedFunc<T1, T2, T3, TResult>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, () => Builder.GetFunc<T1, T2, T3, TResult>(methodName));
             if (f == null) return PluginTypedDelegates.Func<T1, T2, T3, TResult>(PerCall<TResult>(methodName));
             return (a, b, c) => { try { return f(a, b, c); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Func<T1, T2, T3, T4, TResult?> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName)
+        public Func<T1, T2, T3, T4, TResult?> GetFunc<T1, T2, T3, T4, TResult>(string methodName)
         {
-            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, () => Builder.GetTypedFunc<T1, T2, T3, T4, TResult>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, () => Builder.GetFunc<T1, T2, T3, T4, TResult>(methodName));
             if (f == null) return PluginTypedDelegates.Func<T1, T2, T3, T4, TResult>(PerCall<TResult>(methodName));
             return (a, b, c, d) => { try { return f(a, b, c, d); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Action GetTypedAction(string methodName)
+        public Action<T1> GetAction<T1>(string methodName)
         {
-            var f = TryTyped(methodName, Type.EmptyTypes, () => Builder.GetTypedAction(methodName));
-            if (f == null) return PluginTypedDelegates.Action(PerCallAction(methodName));
-            return () => { try { f(); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
-        }
-
-        public Action<T1> GetTypedAction<T1>(string methodName)
-        {
-            var f = TryTyped(methodName, new[] { typeof(T1) }, () => Builder.GetTypedAction<T1>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1) }, () => Builder.GetAction<T1>(methodName));
             if (f == null) return PluginTypedDelegates.Action<T1>(PerCallAction(methodName));
             return a => { try { f(a); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName)
+        public Action<T1, T2> GetAction<T1, T2>(string methodName)
         {
-            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2) }, () => Builder.GetTypedAction<T1, T2>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2) }, () => Builder.GetAction<T1, T2>(methodName));
             if (f == null) return PluginTypedDelegates.Action<T1, T2>(PerCallAction(methodName));
             return (a, b) => { try { f(a, b); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName)
+        public Action<T1, T2, T3> GetAction<T1, T2, T3>(string methodName)
         {
-            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, () => Builder.GetTypedAction<T1, T2, T3>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, () => Builder.GetAction<T1, T2, T3>(methodName));
             if (f == null) return PluginTypedDelegates.Action<T1, T2, T3>(PerCallAction(methodName));
             return (a, b, c) => { try { f(a, b, c); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
-        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName)
+        public Action<T1, T2, T3, T4> GetAction<T1, T2, T3, T4>(string methodName)
         {
-            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, () => Builder.GetTypedAction<T1, T2, T3, T4>(methodName));
+            var f = TryTyped(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, () => Builder.GetAction<T1, T2, T3, T4>(methodName));
             if (f == null) return PluginTypedDelegates.Action<T1, T2, T3, T4>(PerCallAction(methodName));
             return (a, b, c, d) => { try { f(a, b, c, d); } catch (Exception ex) when (IsPluginFault(ex)) { throw ToPluginException(methodName, ex); } };
         }
 
         // Derlenmiş tipli delegate kurulabiliyor mu? Metot Task döndürüyorsa (beklenmesi gerekir), tip dönüşümü
-        // yoksa (InvalidCastException) ya da void metot için GetTypedFunc istendiyse null -> genel yol.
+        // yoksa (InvalidCastException) ya da void metot için GetFunc istendiyse null -> genel yol.
         // "Metot yok" gibi çağıran hataları olduğu gibi fırlar.
         private D? TryTyped<D>(string methodName, Type[] argTypes, Func<D> build) where D : Delegate
         {

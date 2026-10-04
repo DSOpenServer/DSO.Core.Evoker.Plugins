@@ -158,16 +158,14 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         }
 
         // Tipli delegate'ler: sandbox'ta her çağrı zaten IPC - GetFunc/GetAction üzerine tipli kabuk.
-        public Func<TResult?> GetTypedFunc<TResult>(string methodName) => PluginTypedDelegates.Func(GetFunc<TResult>(methodName));
-        public Func<T1, TResult?> GetTypedFunc<T1, TResult>(string methodName) => PluginTypedDelegates.Func<T1, TResult>(GetFunc<TResult>(methodName));
-        public Func<T1, T2, TResult?> GetTypedFunc<T1, T2, TResult>(string methodName) => PluginTypedDelegates.Func<T1, T2, TResult>(GetFunc<TResult>(methodName));
-        public Func<T1, T2, T3, TResult?> GetTypedFunc<T1, T2, T3, TResult>(string methodName) => PluginTypedDelegates.Func<T1, T2, T3, TResult>(GetFunc<TResult>(methodName));
-        public Func<T1, T2, T3, T4, TResult?> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName) => PluginTypedDelegates.Func<T1, T2, T3, T4, TResult>(GetFunc<TResult>(methodName));
-        public Action GetTypedAction(string methodName) => PluginTypedDelegates.Action(GetAction(methodName));
-        public Action<T1> GetTypedAction<T1>(string methodName) => PluginTypedDelegates.Action<T1>(GetAction(methodName));
-        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName) => PluginTypedDelegates.Action<T1, T2>(GetAction(methodName));
-        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName) => PluginTypedDelegates.Action<T1, T2, T3>(GetAction(methodName));
-        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName) => PluginTypedDelegates.Action<T1, T2, T3, T4>(GetAction(methodName));
+        public Func<T1, TResult?> GetFunc<T1, TResult>(string methodName) => PluginTypedDelegates.Func<T1, TResult>(GetFunc<TResult>(methodName));
+        public Func<T1, T2, TResult?> GetFunc<T1, T2, TResult>(string methodName) => PluginTypedDelegates.Func<T1, T2, TResult>(GetFunc<TResult>(methodName));
+        public Func<T1, T2, T3, TResult?> GetFunc<T1, T2, T3, TResult>(string methodName) => PluginTypedDelegates.Func<T1, T2, T3, TResult>(GetFunc<TResult>(methodName));
+        public Func<T1, T2, T3, T4, TResult?> GetFunc<T1, T2, T3, T4, TResult>(string methodName) => PluginTypedDelegates.Func<T1, T2, T3, T4, TResult>(GetFunc<TResult>(methodName));
+        public Action<T1> GetAction<T1>(string methodName) => PluginTypedDelegates.Action<T1>(GetAction(methodName));
+        public Action<T1, T2> GetAction<T1, T2>(string methodName) => PluginTypedDelegates.Action<T1, T2>(GetAction(methodName));
+        public Action<T1, T2, T3> GetAction<T1, T2, T3>(string methodName) => PluginTypedDelegates.Action<T1, T2, T3>(GetAction(methodName));
+        public Action<T1, T2, T3, T4> GetAction<T1, T2, T3, T4>(string methodName) => PluginTypedDelegates.Action<T1, T2, T3, T4>(GetAction(methodName));
 
         private Func<object?[], Task<WireValue>> CreateResolvedCall(string methodName, object?[]? sampleArgs)
         {

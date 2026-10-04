@@ -1055,28 +1055,28 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 await doAsyncFn(new object?[] { 4 });
                 Check("GetActionAsync DoAsyncWork(4) -> field=40", b.GetValue<int>("LastVoidCallValue") == 40);
 
-                Console.WriteLine("-- Tipli delegate'ler (GetTypedFunc / GetTypedAction) --");
-                var tAdd = b.GetTypedFunc<int, int, int>("Add");
+                Console.WriteLine("-- Tipli delegate'ler (GetFunc / GetAction) --");
+                var tAdd = b.GetFunc<int, int, int>("Add");
                 long tSum = 0;
                 for (int i = 0; i < 2000; i++) tSum += tAdd(i, 1);
-                Check("GetTypedFunc<int,int,int> Add x2000", tSum == Enumerable.Range(0, 2000).Sum(i => (long)i + 1));
-                Check("dönüş genişletme: GetTypedFunc<int,int,long> Add(2,3)=5L", b.GetTypedFunc<int, int, long>("Add")(2, 3) == 5L);
-                Check("Task<int> dönen metot bekleniyor: GetTypedFunc<int,int,int> AddAsync(4,5)=9", b.GetTypedFunc<int, int, int>("AddAsync")(4, 5) == 9);
-                Check("Complex argüman (host DTO): GetTypedFunc<PointDto,int> SumPoint", b.GetTypedFunc<PointDto, int>("SumPoint")(new PointDto { X = 2, Y = 3 }) == 5);
-                var tmp = b.GetTypedFunc<int, int, PointDto>("MakePoint")(7, 9);
-                Check("Complex dönüş (host DTO): GetTypedFunc<int,int,PointDto> MakePoint", tmp is { X: 7, Y: 9 });
-                Check("overload tipe göre: GetTypedFunc<string,string,string> Combine", b.GetTypedFunc<string, string, string>("Combine")("a", "b") == "a+b");
-                Check("static: GetTypedFunc<int,int> StaticTwice", b.GetTypedFunc<int, int>("StaticTwice")(21) == 42);
-                b.GetTypedAction<int>("DoSomething")(8);
-                Check("GetTypedAction<int> DoSomething(8) -> field=8", b.GetValue<int>("LastVoidCallValue") == 8);
-                b.GetTypedAction<int>("DoAsyncWork")(2);
-                Check("GetTypedAction Task dönen metot BEKLENİYOR -> field=20", b.GetValue<int>("LastVoidCallValue") == 20);
-                var tDiv = b.GetTypedFunc<int, int, int>("CheckedDivide");
+                Check("GetFunc<int,int,int> Add x2000", tSum == Enumerable.Range(0, 2000).Sum(i => (long)i + 1));
+                Check("dönüş genişletme: GetFunc<int,int,long> Add(2,3)=5L", b.GetFunc<int, int, long>("Add")(2, 3) == 5L);
+                Check("Task<int> dönen metot bekleniyor: GetFunc<int,int,int> AddAsync(4,5)=9", b.GetFunc<int, int, int>("AddAsync")(4, 5) == 9);
+                Check("Complex argüman (host DTO): GetFunc<PointDto,int> SumPoint", b.GetFunc<PointDto, int>("SumPoint")(new PointDto { X = 2, Y = 3 }) == 5);
+                var tmp = b.GetFunc<int, int, PointDto>("MakePoint")(7, 9);
+                Check("Complex dönüş (host DTO): GetFunc<int,int,PointDto> MakePoint", tmp is { X: 7, Y: 9 });
+                Check("overload tipe göre: GetFunc<string,string,string> Combine", b.GetFunc<string, string, string>("Combine")("a", "b") == "a+b");
+                Check("static: GetFunc<int,int> StaticTwice", b.GetFunc<int, int>("StaticTwice")(21) == 42);
+                b.GetAction<int>("DoSomething")(8);
+                Check("GetAction<int> DoSomething(8) -> field=8", b.GetValue<int>("LastVoidCallValue") == 8);
+                b.GetAction<int>("DoAsyncWork")(2);
+                Check("GetAction Task dönen metot BEKLENİYOR -> field=20", b.GetValue<int>("LastVoidCallValue") == 20);
+                var tDiv = b.GetFunc<int, int, int>("CheckedDivide");
                 await ExpectAsync<PluginInvocationException>("tipli delegate'te plugin hatası -> PluginInvocationException",
                     () => { tDiv(1, 0); return Task.CompletedTask; }, ex => ex.RemoteExceptionType == typeof(DivideByZeroException).FullName);
                 Check("hatadan sonra aynı tipli delegate çalışıyor", tDiv(10, 2) == 5);
                 if (b.IncludeNonPublic)
-                    Check("private: GetTypedFunc<int,int,int> MultiplySecret(6,7)=42", b.GetTypedFunc<int, int, int>("MultiplySecret")(6, 7) == 42);
+                    Check("private: GetFunc<int,int,int> MultiplySecret(6,7)=42", b.GetFunc<int, int, int>("MultiplySecret")(6, 7) == 42);
 
                 Console.WriteLine("-- Hatalar (iki modda AYNI exception tipleri) --");
                 await ExpectAsync<PluginInvocationException>("plugin exception -> PluginInvocationException",
@@ -1447,7 +1447,7 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Check("event (sandbox)", counterEvents.Count == 1);
             Check("GetFunc (sandbox)", add(new object?[] { 1, 1 }) == 2);
 
-            var tAdd = app.GetTypedFunc<int, int, int>("Add");
+            var tAdd = app.GetFunc<int, int, int>("Add");
             Check("tipli delegate (sandbox): tAdd(2,3)=5", tAdd(2, 3) == 5);
 
             Console.WriteLine("\n=== 3) Admin: Sandbox -> InProcess (canlı geçiş) ===");
@@ -1669,9 +1669,9 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 var add = b.GetFunc<int>("Add", new object?[] { 0, 0 });
                 check("GetFunc", add(new object?[] { 5, 5 }) == 10, "");
                 // Optimizasyon turunda eklenen cache'ler de plugin tiplerine referans tutar - unload'u ENGELLEMEMELİ:
-                check("tipli delegate (EvokerBuilder tipli cache'i)", b.GetTypedFunc<int, int, int>("Add")(2, 2) == 4, "");
+                check("tipli delegate (EvokerBuilder tipli cache'i)", b.GetFunc<int, int, int>("Add")(2, 2) == 4, "");
                 check("Complex ARGÜMAN (derlenmiş şekil eşleyici host DTO -> plugin Point)", b.Invoke<int>("SumPoint", new PointDto { X = 1, Y = 2 }) == 3, "");
-                check("tipli Complex dönüş (eşleyici plugin Point -> host DTO)", b.GetTypedFunc<int, int, PointDto>("MakePoint")(5, 6) is { X: 5, Y: 6 }, "");
+                check("tipli Complex dönüş (eşleyici plugin Point -> host DTO)", b.GetFunc<int, int, PointDto>("MakePoint")(5, 6) is { X: 5, Y: 6 }, "");
                 check("InvokeDynamicAsync Task<T> planı (derlenmiş sonuç okuyucu)", (int)(await loader.Builder!.InvokeDynamicAsync("AddAsync", new object?[] { 1, 1 }))! == 2, "");
                 int evt = 0;
                 using (loader.Builder!.AddEventHandler("CounterChanged", a => evt = (int)a[1]!))
@@ -1890,10 +1890,10 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Add("A", "A7 IPluginBuilder (in-process).InvokeAsync<int> (await)", await MeasureAsync(N / 2, async () => x = await ipb.InvokeAsync<int>("Add", x & 1023, 1)));
             var ipbFunc = ipb.GetFunc<int>("Add", new object?[] { 0, 0 });
             Add("A", "A8 IPluginBuilder (in-process).GetFunc<int>", Measure(N, () => x = ipbFunc(new object?[] { x & 1023, 1 })));
-            var ebTyped = eb.GetTypedFunc<int, int, int>("Add");
-            Add("A", "A10 EvokerBuilder.GetTypedFunc<int,int,int> (boxing yok)", Measure(N * 5, () => x = ebTyped(x & 1023, 1)));
-            var ipbTyped = ipb.GetTypedFunc<int, int, int>("Add");
-            Add("A", "A11 IPluginBuilder (in-process).GetTypedFunc<int,int,int>", Measure(N * 5, () => x = ipbTyped(x & 1023, 1)));
+            var ebTyped = eb.GetFunc<int, int, int>("Add");
+            Add("A", "A10 EvokerBuilder.GetFunc<int,int,int> (boxing yok)", Measure(N * 5, () => x = ebTyped(x & 1023, 1)));
+            var ipbTyped = ipb.GetFunc<int, int, int>("Add");
+            Add("A", "A11 IPluginBuilder (in-process).GetFunc<int,int,int>", Measure(N * 5, () => x = ipbTyped(x & 1023, 1)));
             var batchArgs = Enumerable.Range(0, 10_000).Select(i => new object?[] { i, 1 }).ToList();
             var rb = await MeasureAsync(20, async () => await ipb.InvokeBatchAsync<int>("Add", batchArgs));
             Add("A", "A9 IPluginBuilder (in-process).InvokeBatchAsync (çağrı başına)", (rb.ns / batchArgs.Count, rb.bytes / batchArgs.Count));
@@ -1924,8 +1924,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             var proxyFunc = proxy.GetFunc<int>("Add", new object?[] { 0, 0 });
             Add("D", "D2 proxy.GetFunc<int>", Measure(N, () => x = proxyFunc(new object?[] { x & 1023, 1 })));
             Add("D", "D3 proxy.GetValue<int>", Measure(N / 2, () => x = proxy.GetValue<int>("Counter")));
-            var proxyTyped = proxy.GetTypedFunc<int, int, int>("Add");
-            Add("D", "D4 proxy.GetTypedFunc<int,int,int>", Measure(N * 2, () => x = proxyTyped(x & 1023, 1)));
+            var proxyTyped = proxy.GetFunc<int, int, int>("Add");
+            Add("D", "D4 proxy.GetFunc<int,int,int>", Measure(N * 2, () => x = proxyTyped(x & 1023, 1)));
 
             // =====================================================================================
             Console.WriteLine("\n=== E) Sandbox (ayrı worker process, named pipe) ===");
@@ -1947,8 +1947,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Add("E", "E7 sandbox SetValue<int>", Measure(S, () => sb.SetValue("Counter", x & 1023)));
             Add("E", "E8 sandbox Invoke<PointDto>(\"MakePoint\") (Complex dönüş)", Measure(S / 2, () => sb.Invoke<PointDto>("MakePoint", 1, 2)));
             Add("E", "E9 sandbox Invoke<int>(\"SumPoint\", PointDto) (Complex argüman)", Measure(S / 2, () => x = sb.Invoke<int>("SumPoint", dto)));
-            var sbTyped = sb.GetTypedFunc<int, int, int>("Add");
-            Add("E", "E11 sandbox GetTypedFunc<int,int,int>", Measure(S, () => x = sbTyped(x & 1023, 1)));
+            var sbTyped = sb.GetFunc<int, int, int>("Add");
+            Add("E", "E11 sandbox GetFunc<int,int,int>", Measure(S, () => x = sbTyped(x & 1023, 1)));
             string big = new string('x', 100_000);
             var rBig = Measure(300, () => sb.Invoke<string>("Greet", big, "Merhaba"));
             Add("E", "E10 sandbox Greet(100 KB metin) - gidiş + dönüş", rBig, $"≈ {200_000 / (rBig.ns / 1e9) / 1_048_576:0} MB/s");
