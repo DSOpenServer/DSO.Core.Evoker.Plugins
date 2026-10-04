@@ -15,24 +15,34 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
     /// </summary>
     public static class IpcMessageCodec
     {
-        // --- Hello: [1 byte Success][Success ise: TypeFullName][değilse: Error] ---
+        // --- Hello: [1 byte Success][Success ise: TypeFullName][değilse: Error][ProtocolVersion int] ---
+        // ProtocolVersion SONA eklendi: bu alan yokken derlenmiş eski worker'ların Hello'su da okunabilsin
+        // (o durumda sürüm 0 sayılır ve host uyumsuzluk hatası verir - bkz. IpcProtocol).
 
-        public static byte[] EncodeHello(bool success, string? typeFullName, string? error)
+        public static byte[] EncodeHello(bool success, string? typeFullName, string? error, int protocolVersion = IpcProtocol.Version)
         {
             using var ms = new MemoryStream();
             using var bw = new BinaryWriter(ms, Encoding.UTF8);
             bw.Write(success);
             bw.Write(success ? (typeFullName ?? "") : (error ?? ""));
+            bw.Write(protocolVersion);
             return ms.ToArray();
         }
 
         public static (bool Success, string? TypeFullName, string? Error) DecodeHello(byte[] payload)
         {
+            var (success, typeName, error, _) = DecodeHelloWithVersion(payload);
+            return (success, typeName, error);
+        }
+
+        public static (bool Success, string? TypeFullName, string? Error, int ProtocolVersion) DecodeHelloWithVersion(byte[] payload)
+        {
             using var ms = new MemoryStream(payload);
             using var br = new BinaryReader(ms, Encoding.UTF8);
             bool success = br.ReadBoolean();
             string text = br.ReadString();
-            return success ? (true, text, null) : (false, null, text);
+            int version = ms.Length - ms.Position >= 4 ? br.ReadInt32() : 0;
+            return success ? (true, text, null, version) : (false, null, text, version);
         }
 
         // --- Fault: [Message] ---

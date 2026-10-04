@@ -17,8 +17,17 @@ namespace DSO.Core.Evoker.Plugins.Management
     /// </summary>
     public sealed class PluginRegistration
     {
-        /// <summary>Uygulamanın plugin'e verdiği sabit kimlik (ör. "erp-entegrasyon"). Uygulama kodu buna göre ister.</summary>
+        /// <summary>
+        /// Kaydın anahtarı - uygulama plugin'i bununla ister (PluginManager.Get(id)). Admin'in verdiği isim
+        /// (ör. "erp-sirketA"); boş bırakılırsa kayıt anında BİR KEZ GUID üretilir ve kalıcı saklanır (sonraki
+        /// açılışlarda aynı kalır). Aynı DLL + tip farklı Id'lerle istendiği kadar eklenebilir; her kayıt kendi
+        /// worker'ında / kendi context'inde, kendi state'iyle çalışır. Büyük/küçük harf duyarsız benzersizdir.
+        /// </summary>
         public string Id { get; set; } = "";
+
+        /// <summary>Admin ekranı için: "Tip [Id]" - aynı plugin'in örnekleri sınıf adıyla birlikte ayırt edilir. Saklanmaz.</summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string DisplayName => $"{TypeFullName} [{Id}]";
         public string FilePath { get; set; } = "";
         public string TypeFullName { get; set; } = "";
 
@@ -55,5 +64,20 @@ namespace DSO.Core.Evoker.Plugins.Management
         public bool? LastUnloadReleasedMemory { get; init; }
         public DateTime? LastCrashUtc { get; init; }
         public string? LastCrashReason { get; init; }
+    }
+
+    /// <summary>
+    /// RegisterAsync sonucu. Admin'in yapabileceği beklenen hatalar (aynı isim, dosya/tip yok, .NET değil) exception
+    /// DEĞİL, Success=false + Message ile döner ve kayıt EKLENMEZ - admin ekranı mesajı doğrudan gösterebilir.
+    /// </summary>
+    public sealed class PluginRegistrationResult
+    {
+        public bool Success { get; init; }
+        /// <summary>Başarılıysa kaydın Id'si (verilmediyse üretilen GUID).</summary>
+        public string? Id { get; init; }
+        public string Message { get; init; } = "";
+
+        public static PluginRegistrationResult Ok(string id, string message) => new() { Success = true, Id = id, Message = message };
+        public static PluginRegistrationResult Fail(string message, string? id = null) => new() { Success = false, Id = id, Message = message };
     }
 }

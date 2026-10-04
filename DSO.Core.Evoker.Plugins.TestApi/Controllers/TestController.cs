@@ -31,5 +31,23 @@ namespace DSO.Core.Evoker.Plugins.TestApi.Controllers
         {
             await PariteTesti.TestParite();
         }
+
+        [HttpGet("Test5PluginManagerTest")]
+        public async Task Test5PluginManagerTest()
+        {
+            await PluginManagerTesti.PluginManagerTest();
+        }
+
+        [HttpGet("Test6InProcessPluginTest")]
+        public async Task Test6InProcessPluginTest()
+        {
+            await InProcessPluginTesti.TestRun();
+        }
+
+        [HttpGet("Test7PerformansTest")]
+        public async Task Test7PerformansTest()
+        {
+            await PerformansTesti.TestRun();
+        }
     }
 }

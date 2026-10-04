@@ -188,6 +188,9 @@ namespace DSO.Core.Evoker.Plugins.Management
             lock (_subsLock) _subs.Remove(s);
         }
 
+        // --- Tanım ---
+        public Task<Scanning.PluginDescriptor> DescribeAsync(bool includeValues = true) => Run(b => b.DescribeAsync(includeValues));
+
         // --- Cache ---
         public Task ForgetCacheAsync() => Run(b => b.ForgetCacheAsync());
         public void ForgetCache() => Sync(ForgetCacheAsync());

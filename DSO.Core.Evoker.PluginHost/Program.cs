@@ -54,11 +54,11 @@ try
 {
     loader = new ManagedDotNetPluginLoader();
     await loader.LoadInProcessAsync(pluginFilePath, typeFullName, includeNonPublic).ConfigureAwait(false);
-    await writer.WriteHelloAsync(success: true, typeFullName: loader.Builder!.Type.FullName, error: null).ConfigureAwait(false);
+    await writer.WriteHelloAsync(success: true, typeFullName: loader.Builder!.Type.FullName, error: null, protocolVersion: IpcProtocol.Version).ConfigureAwait(false);
 }
 catch (Exception ex)
 {
-    try { await writer.WriteHelloAsync(success: false, typeFullName: null, error: ex.Message).ConfigureAwait(false); }
+    try { await writer.WriteHelloAsync(success: false, typeFullName: null, error: ex.Message, protocolVersion: IpcProtocol.Version).ConfigureAwait(false); }
     catch { /* pipe zaten kopmuş olabilir - önemli değil, zaten çıkıyoruz */ }
     return 1;
 }
@@ -165,7 +165,8 @@ void HandleResolve(ResolveRequest request)
                 Success = false,
                 Error = anyByName
                     ? $"'{request.MethodName}' için {request.ArgTypeCodes.Count} argümanla çağrılabilen bir overload yok."
-                    : $"'{request.MethodName}' metodu bulunamadı."
+                    : $"'{request.MethodName}' metodu bulunamadı. '{loadedType.FullName}' ({loadedType.Assembly.Location}) " +
+                      $"içindeki metotlar: {string.Join(", ", loadedType.GetMethods(bindingFlags).Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object)).Select(m => m.Name).Distinct().OrderBy(n => n))}"
             };
         }
         else

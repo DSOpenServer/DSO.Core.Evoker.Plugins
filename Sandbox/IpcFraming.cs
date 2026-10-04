@@ -60,8 +60,12 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
         // TODO 7: yüksek seviye yardımcı metodlar - IpcMessageCodec'e (TODO 7/8) delege ediyor.
 
-        public Task WriteHelloAsync(bool success, string? typeFullName, string? error, CancellationToken ct = default) =>
-            WriteFrameAsync(IpcMessageType.Hello, IpcMessageCodec.EncodeHello(success, typeFullName, error), ct);
+        /// <param name="protocolVersion">
+        /// Worker bunu KENDİ kodundan "IpcProtocol.Version" olarak geçmeli: const, çağıranın (worker exe'sinin)
+        /// içine derlenir - böylece eski bir exe'nin yanında yeni bir Plugins DLL'i olsa bile exe'nin gerçek sürümü gider.
+        /// </param>
+        public Task WriteHelloAsync(bool success, string? typeFullName, string? error, int protocolVersion, CancellationToken ct = default) =>
+            WriteFrameAsync(IpcMessageType.Hello, IpcMessageCodec.EncodeHello(success, typeFullName, error, protocolVersion), ct);
 
         public Task WriteResolveRequestAsync(ResolveRequest request, CancellationToken ct = default) =>
             WriteFrameAsync(IpcMessageType.Resolve, IpcMessageCodec.EncodeResolveRequest(request), ct);

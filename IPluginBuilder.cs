@@ -88,6 +88,15 @@ namespace DSO.Core.Evoker.Plugins
         /// <summary>Plugin tipinin (IncludeNonPublic'e göre görülebilen) event adları.</summary>
         string[] GetEventNames();
 
+        // --- Tanım (bilgi) ---
+        /// <summary>
+        /// Plugin tipinin tam tanımı: assembly bilgisi, constructor/metot (parametreleri, default değerleri)/
+        /// property (get-set görünürlüğü)/field/event - private'lar dahil; includeValues=true ise field ve
+        /// property'lerin O ANKİ değerleri de. JSON için: (await b.DescribeAsync()).ToJson(). Yapı DLL
+        /// çalıştırılmadan okunur; değerler çalışan instance'tan (property getter'ları çalıştırılır).
+        /// </summary>
+        Task<Scanning.PluginDescriptor> DescribeAsync(bool includeValues = true);
+
         // --- Cache ---
         /// <summary>Plugin tipinin DynamicEntityAccessor cache'ini temizler (sandbox'ta worker içinde).</summary>
         void ForgetCache();

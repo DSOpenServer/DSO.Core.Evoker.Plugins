@@ -328,7 +328,7 @@ namespace DSO.Core.Evoker.Plugins.Scanning
         /// yine de bazı tipler çözülemeyebilir, bu durumda Scan() metodundaki ReflectionTypeLoadException
         /// yakalama mantığı devreye girer, tüm tarama düşmez.
         /// </summary>
-        private static MetadataLoadContext CreateMetadataLoadContext(string filePath)
+        internal static MetadataLoadContext CreateMetadataLoadContext(string filePath)
         {
             var runtimeDir = RuntimeEnvironment.GetRuntimeDirectory();
             var pluginDir = Path.GetDirectoryName(Path.GetFullPath(filePath)) ?? runtimeDir;

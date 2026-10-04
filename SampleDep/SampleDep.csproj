@@ -8,4 +8,10 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Compile Remove="depv2\**" />
+    <EmbeddedResource Remove="depv2\**" />
+    <None Remove="depv2\**" />
+  </ItemGroup>
+
 </Project>

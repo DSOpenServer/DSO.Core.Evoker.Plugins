@@ -41,17 +41,18 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// <summary>Pool'daki herhangi bir worker yeniden başlatıldığında (bkz. PluginWorkerHandle.Restarted).</summary>
         public event EventHandler<PluginWorkerRestartedEventArgs>? WorkerRestarted;
 
-        private static string Key(string pluginFilePath, string typeFullName) =>
-            $"{System.IO.Path.GetFullPath(pluginFilePath)}|{typeFullName}";
+        // instanceName: aynı plugin'den BİRDEN FAZLA worker isteniyorsa her birine verilen ad (null = tek örnek).
+        private static string Key(string pluginFilePath, string typeFullName, string? instanceName) =>
+            $"{System.IO.Path.GetFullPath(pluginFilePath)}|{typeFullName}|{instanceName}";
 
         /// <summary>
         /// TODO 20: varsa mevcut (aynı dosya+tip için) worker'ı döndür, yoksa yeni bir
         /// PluginWorkerHandle yaratıp StartAsync çağırarak döndürür.
         /// </summary>
-        public Task<PluginWorkerHandle> GetOrStartAsync(string pluginFilePath, string typeFullName, PluginWorkerOptions options, bool includeNonPublic = false)
+        public Task<PluginWorkerHandle> GetOrStartAsync(string pluginFilePath, string typeFullName, PluginWorkerOptions options, bool includeNonPublic = false, string? instanceName = null)
         {
             if (options == null) throw new ArgumentNullException(nameof(options));
-            string key = Key(pluginFilePath, typeFullName);
+            string key = Key(pluginFilePath, typeFullName, instanceName);
 
             var entry = _workers.GetOrAdd(key, _ => new Entry(options, includeNonPublic, new Lazy<Task<PluginWorkerHandle>>(async () =>
             {
@@ -114,9 +115,9 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// TODO 21: belirli bir plugin+tip'in worker'ını (varsa) düzgün kapat (Shutdown handshake +
         /// graceful exit bekle) ve pool'dan çıkar.
         /// </summary>
-        public async Task StopAsync(string pluginFilePath, string typeFullName)
+        public async Task StopAsync(string pluginFilePath, string typeFullName, string? instanceName = null)
         {
-            if (!_workers.TryRemove(Key(pluginFilePath, typeFullName), out var entry))
+            if (!_workers.TryRemove(Key(pluginFilePath, typeFullName, instanceName), out var entry))
                 return; // hiç başlatılmamış - yapacak bir şey yok
 
             if (!entry.Handle.IsValueCreated)

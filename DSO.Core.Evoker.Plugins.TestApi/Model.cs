@@ -1,8 +1,13 @@
-﻿using DSO.Core.Evoker.Plugins;
+﻿using DSO.Core.Evoker;
+using DSO.Core.Evoker.Plugins;
 using DSO.Core.Evoker.Plugins.Loading;
+using DSO.Core.Evoker.Plugins.Management;
 using DSO.Core.Evoker.Plugins.Sandbox;
 using DSO.Core.Evoker.Plugins.Scanning;
+using System;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Loader;
 using System.Text.Json;
 
 namespace DSO.Core.Evoker.Plugins.TestApi
@@ -914,10 +919,16 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             // NOT: Bu proje SamplePlugin'e derleme zamanı referans VERMİYOR - host plugin tiplerini (Point, Level)
             // bilmiyor; kendi PointDto'sunu ve int'i kullanıyor (gerçek senaryo).
 
-
             const string TypeName = "TestPlugin.SamplePlugin";
 
+            if (!PreflightSamplePlugin(dllPath))
+            {
+                Console.WriteLine(2);
+                return;
+            }
+
             int failures = 0;
+            var DescribeStructures = new Dictionary<bool, string>();
             void Check(string label, bool ok, string detail = "")
             {
                 Console.WriteLine($"  [{(ok ? "OK" : "HATA")}] {label}{(detail.Length > 0 ? "  -> " + detail : "")}");
@@ -951,6 +962,17 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             };
 
             async Task RunScenarioAsync(IPluginBuilder b)
+            {
+                try { await RunScenarioCoreAsync(b); }
+                catch (Exception ex)
+                {
+                    // Bir kontrolün içindeki çağrı beklenmedik bir exception fırlatırsa test programı KAPANMASIN:
+                    // bu modun kalan kontrolleri atlanır, hata raporlanır, diğer modlara devam edilir.
+                    Check($"senaryo beklenmedik bir hatayla KESİLDİ ({(b.IsSandboxed ? "sandbox" : "in-process")})", false, $"{ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            async Task RunScenarioCoreAsync(IPluginBuilder b)
             {
                 Console.WriteLine($"\n===== {(b.IsSandboxed ? "SANDBOX" : "IN-PROCESS")} (IncludeNonPublic={b.IncludeNonPublic}) =====");
 
@@ -1116,6 +1138,50 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 await b.ExecuteBatchAsync("DoSomething", new[] { new object?[] { 1 }, new object?[] { 2 }, new object?[] { 3 } });
                 Check("ExecuteBatchAsync - son çağrının etkisi görünüyor (field=3)", b.GetValue<int>("LastVoidCallValue") == 3);
 
+                Console.WriteLine("-- Plugin tanımı (DescribeAsync -> JSON) --");
+                var desc = await b.DescribeAsync();
+                var json = desc.ToJson();
+                string jsonFile = Path.Combine(Path.GetTempPath(), $"plugin-describe-{(b.IsSandboxed ? "sandbox" : "inprocess")}-{(b.IncludeNonPublic ? "nonpublic" : "public")}.json");
+                File.WriteAllText(jsonFile, json);
+                Console.WriteLine($"     (JSON: {jsonFile}, {json.Length} karakter)");
+                var dm = desc.Type.Methods ?? new();
+                var dp = desc.Type.Properties ?? new();
+                var df = desc.Type.Fields ?? new();
+                var opt = dm.FirstOrDefault(x => x.Name == "OptionalDemo");
+                Check("OptionalDemo: 3 parametre, b optional varsayılan 5, s varsayılan \"x\"",
+                    opt?.Parameters?.Count == 3 && opt.Parameters[1].HasDefaultValue == true && Convert.ToInt32(opt.Parameters[1].DefaultValue) == 5
+                    && (string?)opt.Parameters[2].DefaultValue == "x");
+                Check("private metot listede: MultiplySecret (Private)", dm.Any(x => x.Name == "MultiplySecret" && x.Visibility == MemberVisibility.Private));
+                Check("private field ve property listede: _secretCounter, SecretName",
+                    df.Any(x => x.Name == "_secretCounter" && x.Visibility == MemberVisibility.Private) && dp.Any(x => x.Name == "SecretName" && x.Getter == MemberVisibility.Private));
+                Check("gürültü yok: GetType/ToString/Equals, get_/set_/add_, k__BackingField, event alanı",
+                    !dm.Any(x => x.Name is "GetType" or "ToString" or "Equals" or "GetHashCode" || x.Name.StartsWith("get_") || x.Name.StartsWith("add_"))
+                    && !json.Contains("k__BackingField") && !df.Any(x => x.Name is "CounterChanged" or "Progress" or "PointMoved"));
+                Check("PascalCase alan adları + enum metin", json.Contains("\"ReturnType\"") && !json.Contains("\"returnType\"") && json.Contains("\"Visibility\": \"Private\""));
+                Check("okunur tip adları: AddAsync -> Task<int>, IsAsync",
+                    dm.Any(x => x.Name == "AddAsync" && x.ReturnType == "Task<int>" && x.IsAsync == true));
+                Check("static metot işaretli: StaticTwice", dm.Any(x => x.Name == "StaticTwice" && x.IsStatic == true));
+                Check("readonly field: ReadOnlyValue IsReadOnly", df.Any(x => x.Name == "ReadOnlyValue" && x.IsReadOnly == true));
+                Check("event argümanları: CounterChanged(object, int)",
+                    desc.Type.Events?.FirstOrDefault(e => e.Name == "CounterChanged")?.Arguments?.Select(a => a.Type).SequenceEqual(new[] { "object", "int" }) == true);
+                Check("assembly bilgisi: Sha256, sürüm, hedef framework", desc.Assembly.Sha256?.Length == 64 && desc.Assembly.Version != null && desc.Assembly.TargetFramework != null,
+                    $"{desc.Assembly.Name} {desc.Assembly.Version} {desc.Assembly.TargetFramework}");
+                Check("değer: DisplayName = \"yeni ad\"", dp.First(x => x.Name == "DisplayName").Value?.GetString() == "yeni ad");
+                var locVal = dp.First(x => x.Name == "Location").Value;
+                Check("değer: Location (Complex) -> {X,Y} nesnesi", locVal?.ValueKind == System.Text.Json.JsonValueKind.Object && locVal.Value.TryGetProperty("X", out _));
+                Check("değer: field Counter sayı", df.First(x => x.Name == "Counter").Value?.ValueKind == System.Text.Json.JsonValueKind.Number);
+                var secret = df.First(x => x.Name == "_secretCounter");
+                Check(b.IncludeNonPublic ? "değer: private _secretCounter okunuyor" : "private _secretCounter: değer yerine açıklayıcı ValueError",
+                    b.IncludeNonPublic ? secret.Value?.ValueKind == System.Text.Json.JsonValueKind.Number : secret.Value == null && secret.ValueError?.Contains("IncludeNonPublic") == true,
+                    secret.Value?.GetRawText() ?? secret.ValueError ?? "");
+                Check("Values bilgisi: kaynak doğru", desc.Values?.Source == (b.IsSandboxed ? "Sandbox" : "InProcess"));
+                // Yapı (değerler hariç) sandbox ve in-process'te BİREBİR aynı olmalı
+                var structure = (await b.DescribeAsync(includeValues: false)).Type;
+                var structJson = System.Text.Json.JsonSerializer.Serialize(structure, DSO.Core.Evoker.Plugins.Scanning.PluginDescriptor.JsonOptions);
+                if (DescribeStructures.TryGetValue(b.IncludeNonPublic, out var other))
+                    Check("yapı tanımı sandbox ve in-process'te BİREBİR aynı", other == structJson);
+                else DescribeStructures[b.IncludeNonPublic] = structJson;
+
                 Console.WriteLine("-- ForgetCache --");
                 b.ForgetCache();
                 Check("ForgetCache sonrası GetValue hâlâ doğru", b.GetValue<string>("DisplayName") == "yeni ad");
@@ -1205,6 +1271,654 @@ namespace DSO.Core.Evoker.Plugins.TestApi
 
             Console.WriteLine();
             Console.WriteLine(failures == 0 ? "TÜM PARİTE TESTLERİ GEÇTİ." : $"{failures} TEST BAŞARISIZ.");
+            //return failures == 0 ? 0 : 1;
+
+            // --- Ön kontrol: verilen SamplePlugin.dll bu test kitiyle aynı sürüm mü? ---
+            // (Eski bir build verilirse testler anlaşılmaz "metot bulunamadı" hatalarıyla kesiliyordu.)
+            static bool PreflightSamplePlugin(string dll)
+            {
+                var scan = DSO.Core.Evoker.Plugins.Scanning.PluginScanner.Scan(dll);
+                var t = scan.Types.FirstOrDefault(x => x.FullName == "TestPlugin.SamplePlugin");
+                var methods = t?.Methods.Select(m => m.Name).ToHashSet() ?? new HashSet<string>();
+                var events = t?.Events.Select(e => e.Name).ToHashSet() ?? new HashSet<string>();
+                var missing = new[] { "Add", "AddAsync", "MakePoint", "SlowAsync", "OptionalDemo", "UseDependency", "CheckedDivide", "RunWithProgress", "MoveTo", "Increment" }
+                    .Where(m => !methods.Contains(m))
+                    .Concat(new[] { "CounterChanged", "Progress", "PointMoved" }.Where(e => !events.Contains(e)).Select(e => "event " + e))
+                    .ToList();
+                if (missing.Count == 0) return true;
+                Console.WriteLine($"[ÖN KONTROL HATASI] Verilen SamplePlugin.dll bu test kitinden ESKİ: {dll}");
+                Console.WriteLine($"  Dosya tarihi: {File.GetLastWriteTime(dll):yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"  Eksik üyeler: {string.Join(", ", missing)}");
+                Console.WriteLine("  TestKit/SamplePlugin'i güncel SamplePlugin.cs + SamplePlugin.csproj (SampleDep referansı) ile yeniden derleyip");
+                Console.WriteLine("  testi o build çıktısındaki SamplePlugin.dll ile çalıştırın.");
+                return false;
+            }
+
+        }
+
+
+    }
+
+    public static class PluginManagerTesti
+    {
+        static string PluginsFolderPath = Path.Combine(AppContext.BaseDirectory, "Plugins");
+        static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
+        static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
+        static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+
+        public static async Task PluginManagerTest()
+        {
+            // PluginManager testi: kayıt + kalıcılık (JSON), uygulamanın elindeki TEK IPluginBuilder'ın canlı mod
+            // geçişlerinde (sandbox <-> in-process) çalışmaya devam etmesi, event/GetFunc'ın geçişlerden sağ çıkması,
+            // in-process'ten çıkarken belleğin gerçekten boşaltılması, çökme bildirimi, geçersiz kayıt reddi, pool ayar kontrolü.
+            //
+            // Kullanım: dotnet run -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
+
+            const string TypeName = "TestPlugin.SamplePlugin";
+
+            if (!PreflightSamplePlugin(dllPath))
+            {
+                Console.WriteLine(2);
+                return;
+            }
+
+            int failures = 0;
+            void Check(string label, bool ok, string detail = "")
+            {
+                Console.WriteLine($"  [{(ok ? "OK" : "HATA")}] {label}{(detail.Length > 0 ? "  -> " + detail : "")}");
+                if (!ok) failures++;
+            }
+            async Task Expect<TEx>(string label, Func<Task> a) where TEx : Exception
+            {
+                try { await a(); Check(label, false, "exception bekleniyordu"); }
+                catch (TEx ex) { Check(label, true, ex.GetType().Name); }
+                catch (Exception ex) { Check(label, false, $"beklenen {typeof(TEx).Name}, gelen {ex.GetType().Name}: {ex.Message}"); }
+            }
+            static async Task WaitUntil(Func<bool> cond, int timeoutMs = 10000)
+            {
+                var sw = Stopwatch.StartNew();
+                while (!cond() && sw.ElapsedMilliseconds < timeoutMs) await Task.Delay(20);
+            }
+
+            string configPath = Path.Combine(Path.GetTempPath(), "dso-plugins-" + Guid.NewGuid().ToString("N")[..6] + ".json");
+            var managerOptions = new PluginManagerOptions { HostPath = hostDllPath, NotifyOnCrash = false };
+
+            Console.WriteLine("=== 1) Kayıt, doğrulama, kalıcılık ===");
+            var mgr = new PluginManager(new JsonFilePluginConfigStore(configPath), managerOptions);
+            await mgr.InitializeAsync();
+            var r1 = await mgr.RegisterAsync(new PluginRegistration { Id = "sample", FilePath = dllPath, TypeFullName = TypeName, MaxConcurrency = 2 });
+            Check("kayıt başarılı", r1.Success && r1.Id == "sample", r1.Message);
+            Check("kayıt JSON dosyasına yazıldı", File.Exists(configPath) && File.ReadAllText(configPath).Contains("\"Mode\": \"Sandbox\""));
+            var badType = await mgr.RegisterAsync(new PluginRegistration { Id = "x", FilePath = dllPath, TypeFullName = "Yok.BoyleBirTip" });
+            Check("olmayan tip: exception YOK, mesaj var, eklenmedi", !badType.Success && !mgr.Registrations.Any(r => r.Id == "x"), badType.Message);
+            var badFile = await mgr.RegisterAsync(new PluginRegistration { Id = "y", FilePath = "/yok/x.dll", TypeFullName = TypeName });
+            Check("olmayan dosya: exception YOK, mesaj var, eklenmedi", !badFile.Success && !mgr.Registrations.Any(r => r.Id == "y"), badFile.Message);
+            var dup = await mgr.RegisterAsync(new PluginRegistration { Id = "SAMPLE", FilePath = dllPath, TypeFullName = TypeName });
+            Check("aynı ad (büyük/küçük harf farklı) ikinci kez: exception YOK, mesaj var, eklenmedi",
+                !dup.Success && mgr.Registrations.Count(r => r.Id.Equals("sample", StringComparison.OrdinalIgnoreCase)) == 1, dup.Message);
+
+            Console.WriteLine("\n=== 1b) Aynı plugin'in birden çok örneği (isimli + isimsiz) ===");
+            var named = await mgr.RegisterAsync(new PluginRegistration { Id = "sample-sirketB", FilePath = dllPath, TypeFullName = TypeName, Mode = PluginExecutionMode.InProcess });
+            var unnamed = await mgr.RegisterAsync(new PluginRegistration { FilePath = dllPath, TypeFullName = TypeName });
+            Check("isimli ikinci örnek eklendi", named.Success, named.Message);
+            Check("isimsiz örnek: GUID üretildi", unnamed.Success && Guid.TryParse(unnamed.Id, out _), $"{unnamed.Id} - {unnamed.Message}");
+            Check("GUID kalıcı: JSON'a yazıldı", File.ReadAllText(configPath).Contains(unnamed.Id!));
+            Check("DisplayName tip + ad içeriyor", mgr.GetRegistrationCopy(named.Id!).DisplayName == $"{TypeName} [sample-sirketB]");
+            var instA = mgr.Get(named.Id!);
+            var instB = mgr.Get(unnamed.Id!);
+            instA.SetValue("DisplayName", "B şirketi");
+            instB.SetValue("DisplayName", "isimsiz");
+            Check("örneklerin state'i ayrı", instA.GetValue<string>("DisplayName") == "B şirketi" && instB.GetValue<string>("DisplayName") == "isimsiz");
+            Check("biri in-process, diğeri sandbox çalışıyor", !instA.IsSandboxed && instB.IsSandboxed && mgr.GetStatus(unnamed.Id!).ProcessId != null);
+            var mgrDesc = await mgr.DescribeAsync(named.Id!);
+            Check("manager.DescribeAsync: çalışan örneğin değerleri dahil",
+                mgrDesc.Values != null && mgrDesc.Type.Properties!.First(p => p.Name == "DisplayName").Value?.GetString() == "B şirketi");
+            await mgr.StopAsync(named.Id!);
+            var stoppedDesc = await mgr.DescribeAsync(named.Id!);
+            Check("çalışmayan plugin: sadece yapı + uyarı (plugin başlatılmadı)",
+                stoppedDesc.Values == null && stoppedDesc.Warnings?.Count > 0 && !mgr.GetStatus(named.Id!).IsRunning);
+            File.WriteAllText(Path.Combine(Path.GetTempPath(), "plugin-describe-manager.json"), mgrDesc.ToJson());
+            await mgr.UnregisterAsync(named.Id!);
+            await mgr.UnregisterAsync(unnamed.Id!);
+            Check("ek örnekler silindi", mgr.Registrations.Count == 1);
+
+            var scan = mgr.Scan("sample");
+            Check("Scan: property/field/event listesi", scan.Types.Any(t => t.Events.Count >= 3 && t.Properties.Count >= 3), $"{scan.Types[0].Methods.Count} metot, {scan.Types[0].Properties.Count} property, {scan.Types[0].Events.Count} event");
+
+            Console.WriteLine("\n=== 2) Uygulamanın elindeki builder - lazy başlatma (sandbox) ===");
+            IPluginBuilder app = mgr.Get("sample");
+            Check("Get her seferinde AYNI nesne", ReferenceEquals(app, mgr.Get("sample")));
+            Check("henüz başlatılmadı (lazy)", !mgr.GetStatus("sample").IsRunning);
+            Check("ilk çağrı: Add(2,3)=5", app.Invoke<int>("Add", 2, 3) == 5);
+            var st = mgr.GetStatus("sample");
+            Check("şimdi sandbox'ta çalışıyor", st.IsRunning && st.Mode == PluginExecutionMode.Sandbox && st.ProcessId != null && app.IsSandboxed, $"pid={st.ProcessId}");
+
+            var counterEvents = new System.Collections.Concurrent.ConcurrentQueue<int>();
+            var sub = app.Subscribe("CounterChanged", e => counterEvents.Enqueue(e.Get<int>(1)));
+            var add = app.GetFunc<int>("Add", new object?[] { 0, 0 });
+            app.Invoke("Increment");
+            await WaitUntil(() => counterEvents.Count == 1);
+            Check("event (sandbox)", counterEvents.Count == 1);
+            Check("GetFunc (sandbox)", add(new object?[] { 1, 1 }) == 2);
+
+            Console.WriteLine("\n=== 3) Admin: Sandbox -> InProcess (canlı geçiş) ===");
+            var modeChanges = new List<PluginExecutionMode>();
+            mgr.ModeChanged += (_, m) => modeChanges.Add(m);
+            await mgr.SetModeAsync("sample", PluginExecutionMode.InProcess);
+            st = mgr.GetStatus("sample");
+            Check("mod InProcess, çalışıyor, worker yok", st.Mode == PluginExecutionMode.InProcess && st.IsRunning && st.ProcessId == null && !app.IsSandboxed);
+            Check("AYNI builder nesnesi çalışıyor: Add(20,22)=42", app.Invoke<int>("Add", 20, 22) == 42);
+            Check("AYNI GetFunc delegate'i yeni tarafa geçti", add(new object?[] { 5, 5 }) == 10);
+            Check("state sıfırlandı (yeni instance): Counter=0", app.GetValue<int>("Counter") == 0);
+            app.Invoke("Increment");
+            await WaitUntil(() => counterEvents.Count == 2);
+            Check("event aboneliği yeni tarafta otomatik yeniden kuruldu", counterEvents.Count == 2, string.Join(",", counterEvents));
+            Check("ModeChanged bildirimi", modeChanges.SequenceEqual(new[] { PluginExecutionMode.InProcess }));
+            Check("karar kalıcı: JSON'da InProcess", File.ReadAllText(configPath).Contains("\"Mode\": \"InProcess\""));
+
+            Console.WriteLine("\n=== 4) Admin: InProcess -> Sandbox (kesintisiz, eski kopya bellekten atılır) ===");
+            await mgr.SetModeAsync("sample", PluginExecutionMode.Sandbox);
+            st = mgr.GetStatus("sample");
+            Check("mod Sandbox, worker var", st.Mode == PluginExecutionMode.Sandbox && st.ProcessId != null && app.IsSandboxed);
+            Check("eski in-process kopya bellekten GERÇEKTEN boşaltıldı", st.LastUnloadReleasedMemory == true, st.LastUnloadReleasedMemory?.ToString() ?? "null");
+            Check("builder çalışıyor", app.Invoke<int>("Add", 1, 2) == 3);
+            Check("GetFunc çalışıyor", add(new object?[] { 3, 3 }) == 6);
+            app.Invoke("Increment");
+            await WaitUntil(() => counterEvents.Count == 3);
+            Check("event aboneliği tekrar sandbox tarafında", counterEvents.Count == 3);
+            sub.Dispose();
+            app.Invoke("Increment");
+            await Task.Delay(300);
+            Check("abonelikten çıkınca event gelmiyor", counterEvents.Count == 3);
+
+            Console.WriteLine("\n=== 5) Geçiş SIRASINDA süren çağrılar (eşzamanlı yük altında mod değişimi) ===");
+            var cts = new CancellationTokenSource();
+            int okCalls = 0, failedCalls = 0;
+            string? firstError = null;
+            var load = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    try { if (await app.InvokeAsync<int>("Add", 1, 1) == 2) Interlocked.Increment(ref okCalls); }
+                    catch (Exception ex) { Interlocked.Increment(ref failedCalls); firstError ??= $"{ex.GetType().Name}: {ex.Message}"; }
+                }
+            });
+            await Task.Delay(300);
+            await mgr.SetModeAsync("sample", PluginExecutionMode.InProcess);
+            await Task.Delay(300);
+            await mgr.SetModeAsync("sample", PluginExecutionMode.Sandbox);
+            await Task.Delay(300);
+            cts.Cancel();
+            await load;
+            Check("iki canlı geçiş boyunca çağrılar kesintisiz (0 hata)", failedCalls == 0 && okCalls > 100, $"başarılı {okCalls}, hatalı {failedCalls}{(firstError != null ? " - ilk hata: " + firstError : "")}");
+
+            Console.WriteLine("\n=== 6) Kalıcılık: yeni bir PluginManager aynı dosyadan kararları okur ===");
+            await mgr.UpdateAsync("sample", r => { r.MaxConcurrency = 4; r.Notes = "admin notu"; });
+            var mgr2 = new PluginManager(new JsonFilePluginConfigStore(configPath), managerOptions);
+            await mgr2.InitializeAsync();
+            var reg2 = mgr2.GetRegistrationCopy("sample");
+            Check("mod, MaxConcurrency, not okundu", reg2.Mode == PluginExecutionMode.Sandbox && reg2.MaxConcurrency == 4 && reg2.Notes == "admin notu");
+            Check("UpdateAsync sonrası (yeniden başlatıldı) builder çalışıyor", app.Invoke<int>("Add", 4, 4) == 8);
+
+            Console.WriteLine("\n=== 7) Çökme bildirimi + kendini toparlama ===");
+            PluginWorkerCrashedEventArgs? crash = null;
+            string? crashedId = null;
+            mgr.PluginCrashed += (id, e) => { crashedId = id; crash = e; };
+            await Expect<Exception>("CrashHard çağrısı hata verdi (host ayakta)", () => app.ExecuteAsync("CrashHard"));
+            await WaitUntil(() => crash != null);
+            Check("PluginCrashed tetiklendi", crash != null && crashedId == "sample", crash?.Reason.GetType().Name ?? "yok");
+            Check("durum ekranında son çökme görünüyor", mgr.GetStatus("sample").LastCrashUtc != null);
+            Check("sonraki çağrıda taze worker ile devam: Add(5,5)=10", app.Invoke<int>("Add", 5, 5) == 10);
+
+            Console.WriteLine("\n=== 8) Devre dışı bırakma, durdurma, kayıt silme ===");
+            await mgr.StopAsync("sample");
+            Check("StopAsync: çalışmıyor", !mgr.GetStatus("sample").IsRunning);
+            Check("durdurulmuşken çağrı -> yeniden başlar", app.Invoke<int>("Add", 1, 1) == 2);
+            await mgr.UpdateAsync("sample", r => r.Enabled = false);
+            await Expect<InvalidOperationException>("Enabled=false iken çağrı reddedilir", () => app.InvokeAsync("Add", 1, 1));
+            await mgr.UpdateAsync("sample", r => r.Enabled = true);
+            Check("tekrar etkin", app.Invoke<int>("Add", 2, 2) == 4);
+            await mgr.UnregisterAsync("sample");
+            Check("kayıt silindi, JSON'da yok", !mgr.Registrations.Any() && !File.ReadAllText(configPath).Contains("sample"));
+
+            Console.WriteLine("\n=== 9) Pool: aynı plugin farklı ayarla istenirse net hata ===");
+            await using (var pool = new PluginWorkerPool())
+            {
+                var o1 = new PluginWorkerOptions { HostPath = hostDllPath, MaxConcurrency = 1, NotifyOnCrash = false };
+                var h1 = await pool.GetOrStartAsync(dllPath, TypeName, o1);
+                var h1b = await pool.GetOrStartAsync(dllPath, TypeName, new PluginWorkerOptions { HostPath = hostDllPath, MaxConcurrency = 1, NotifyOnCrash = false });
+                Check("aynı ayarlar (farklı nesne) -> aynı worker", ReferenceEquals(h1, h1b));
+                await Expect<InvalidOperationException>("farklı MaxConcurrency -> InvalidOperationException",
+                    () => pool.GetOrStartAsync(dllPath, TypeName, new PluginWorkerOptions { HostPath = hostDllPath, MaxConcurrency = 4 }));
+                await Expect<InvalidOperationException>("farklı includeNonPublic -> InvalidOperationException",
+                    () => pool.GetOrStartAsync(dllPath, TypeName, o1, includeNonPublic: true));
+            }
+
+            await mgr.DisposeAsync();
+            await mgr2.DisposeAsync();
+            File.Delete(configPath);
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM MANAGER TESTLERİ GEÇTİ." : $"{failures} TEST BAŞARISIZ.");
+            //return failures == 0 ? 0 : 1;
+
+            // --- Ön kontrol: verilen SamplePlugin.dll bu test kitiyle aynı sürüm mü? ---
+            // (Eski bir build verilirse testler anlaşılmaz "metot bulunamadı" hatalarıyla kesiliyordu.)
+            static bool PreflightSamplePlugin(string dll)
+            {
+                var scan = DSO.Core.Evoker.Plugins.Scanning.PluginScanner.Scan(dll);
+                var t = scan.Types.FirstOrDefault(x => x.FullName == "TestPlugin.SamplePlugin");
+                var methods = t?.Methods.Select(m => m.Name).ToHashSet() ?? new HashSet<string>();
+                var events = t?.Events.Select(e => e.Name).ToHashSet() ?? new HashSet<string>();
+                var missing = new[] { "Add", "AddAsync", "MakePoint", "SlowAsync", "OptionalDemo", "UseDependency", "CheckedDivide", "RunWithProgress", "MoveTo", "Increment" }
+                    .Where(m => !methods.Contains(m))
+                    .Concat(new[] { "CounterChanged", "Progress", "PointMoved" }.Where(e => !events.Contains(e)).Select(e => "event " + e))
+                    .ToList();
+                if (missing.Count == 0) return true;
+                Console.WriteLine($"[ÖN KONTROL HATASI] Verilen SamplePlugin.dll bu test kitinden ESKİ: {dll}");
+                Console.WriteLine($"  Dosya tarihi: {File.GetLastWriteTime(dll):yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"  Eksik üyeler: {string.Join(", ", missing)}");
+                Console.WriteLine("  TestKit/SamplePlugin'i güncel SamplePlugin.cs + SamplePlugin.csproj (SampleDep referansı) ile yeniden derleyip");
+                Console.WriteLine("  testi o build çıktısındaki SamplePlugin.dll ile çalıştırın.");
+                return false;
+            }
+
+        }
+    }
+
+    public static class InProcessPluginTesti
+    {
+        static string PluginsFolderPath = Path.Combine(AppContext.BaseDirectory, "Plugins");
+        static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
+        static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
+        static string depV2 = Path.Combine(PluginsFolderPath, "depV2", "SampleDep.dll"); 
+        static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+
+        public static async Task TestRun()
+        {
+            // In-process plugin'in kendi AssemblyLoadContext'ine yüklenip GERÇEKTEN boşaltılabildiğini doğrular.
+            //
+            // Kullanım: dotnet run -- <SamplePlugin.dll yolu> [SampleDep v2 dll yolu (opsiyonel)]
+            //   SampleDep v2 üretmek için:  dotnet build SampleDep -c Release -p:DefineConstants=V2 -o depv2
+            //   (verilmezse sürüm-izolasyonu alt testi atlanır, diğerleri çalışır)
+
+            string sourceDll = dllPath; //Path.GetFullPath(args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli."));
+            //string? depV2 = args.Length > 1 ? Path.GetFullPath(args[1]) : null;
+            const string TypeName = "TestPlugin.SamplePlugin";
+
+            if (!PreflightSamplePlugin(sourceDll))
+            {
+                Console.WriteLine(2);
+                return;
+            }
+
+            int failures = 0;
+            void Check(string label, bool ok, string detail = "")
+            {
+                Console.WriteLine($"  [{(ok ? "OK" : "HATA")}] {label}{(detail.Length > 0 ? "  -> " + detail : "")}");
+                if (!ok) failures++;
+            }
+
+            // Plugin klasörünü geçici bir yere kopyala: unload sonrası DLL'in silinip yenisiyle değiştirilebildiğini
+            // gösterebilmek için orijinal build çıktısına dokunmuyoruz.
+            string CopyPluginDir(string name)
+            {
+                var dir = Path.Combine(Path.GetTempPath(), "dso-unloadtest-" + name + "-" + Guid.NewGuid().ToString("N")[..6]);
+                Directory.CreateDirectory(dir);
+                foreach (var f in Directory.GetFiles(Path.GetDirectoryName(sourceDll)!))
+                    File.Copy(f, Path.Combine(dir, Path.GetFileName(f)));
+                return Path.Combine(dir, Path.GetFileName(sourceDll));
+            }
+
+            int PluginContextCount() => AssemblyLoadContext.All.Count(c => c.Name?.StartsWith("Plugin:SamplePlugin.dll") == true);
+
+            // Plugin'i yükleyip "her şeyi" kullanan yardımcı: metot, async, property, Complex (JSON cache'ine
+            // plugin tipi girer), GetFunc, event, optional parametre, kendi bağımlılığı. Hepsi unload'dan önce
+            // temizlenmesi gereken bir cache/referans iz bırakır - unload yine de başarılı olmalı.
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            static async Task<ManagedDotNetPluginLoader> LoadAndUseAsync(string path, Action<string, bool, string> check)
+            {
+                var loader = new ManagedDotNetPluginLoader();
+                await loader.LoadInProcessAsync(path, "TestPlugin.SamplePlugin");
+                IPluginBuilder b = loader.Builder!.AsPluginBuilder();
+
+                check("Add(1,2)=3", b.Invoke<int>("Add", 1, 2) == 3, "");
+                check("AddAsync(2,3)=5", await b.InvokeAsync<int>("AddAsync", 2, 3) == 5, "");
+                b.SetValue("DisplayName", "x");
+                check("Get/SetValue", b.GetValue<string>("DisplayName") == "x", "");
+                var p = b.Invoke<PointDto>("MakePoint", 3, 4);
+                check("Complex dönüş (JSON cache'ine plugin tipi girer)", p is { X: 3, Y: 4 }, "");
+                check("kendi bağımlılığı: UseDependency", b.Invoke<string>("UseDependency") == "SampleDep v1", b.Invoke<string>("UseDependency") ?? "");
+                check("optional + küçük harf: optionaldemo(1)", b.Invoke<string>("optionaldemo", 1) == "1|5|x", "");
+                var add = b.GetFunc<int>("Add", new object?[] { 0, 0 });
+                check("GetFunc", add(new object?[] { 5, 5 }) == 10, "");
+                int evt = 0;
+                using (loader.Builder!.AddEventHandler("CounterChanged", a => evt = (int)a[1]!))
+                    b.Invoke("Increment");
+                check("event (abonelik unload'dan önce kapatıldı)", evt == 1, "");
+                return loader;
+            }
+
+            Console.WriteLine("=== 1) Yükle, her şeyi kullan, boşalt -> context bellekten GİTMELİ ===");
+            string pathA = CopyPluginDir("A");
+            var loaderA = await LoadAndUseAsync(pathA, Check);
+            Check("yüklü plugin context sayısı = 1", PluginContextCount() == 1, PluginContextCount().ToString());
+            bool unloaded = await loaderA.UnloadAsync();
+            Check("UnloadAsync -> true (context GC tarafından toplandı)", unloaded && loaderA.IsMemoryReleased);
+            Check("AssemblyLoadContext.All içinde artık yok", PluginContextCount() == 0, PluginContextCount().ToString());
+            try
+            {
+                File.Delete(pathA);
+                File.Copy(sourceDll, pathA);
+                Check("DLL dosyası silinip yerine yenisi konabildi (kilit yok)", true);
+            }
+            catch (Exception ex) { Check("DLL dosyası serbest", false, ex.Message); }
+            try { await loaderA.InvokeAsync("Add", new object?[] { 1, 1 }); Check("boşaltılmış loader'a çağrı reddedilmeli", false); }
+            catch (InvalidOperationException) { Check("boşaltılmış loader'a çağrı -> InvalidOperationException", true); }
+
+            Console.WriteLine("\n=== 2) Aynı dosyadan YENİDEN yükle (güncelleme senaryosu) ===");
+            var reloaded = await LoadAndUseAsync(pathA, Check);
+            Check("yeniden yüklenen plugin çalışıyor", reloaded.Builder!.Invoke<int>("Add", 20, 22) == 42);
+            Check("yeniden yükleme sonrası boşaltma", await reloaded.UnloadAsync());
+
+            Console.WriteLine("\n=== 3) Çağıran referans tutarken unload -> false; referans bırakılınca bellek serbest ===");
+            var holder = new Holder();
+            var heldLoader = await LoadAndHoldAsync(pathA, holder);
+            bool heldResult = await heldLoader.UnloadAsync(timeoutMs: 1500);
+            Check("builder referansı tutulurken UnloadAsync -> false", !heldResult);
+            holder.Builder = null;
+            for (int i = 0; i < 20 && !heldLoader.IsMemoryReleased; i++) { GC.Collect(); GC.WaitForPendingFinalizers(); await Task.Delay(50); }
+            Check("referans bırakılınca context toplandı (IsMemoryReleased)", heldLoader.IsMemoryReleased);
+
+            Console.WriteLine("\n=== 4) İzolasyon: iki kopya yan yana, farklı bağımlılık sürümleriyle ===");
+            string pathB = CopyPluginDir("B");
+            if (depV2 != null) File.Copy(depV2, Path.Combine(Path.GetDirectoryName(pathB)!, "SampleDep.dll"), overwrite: true);
+            var l1 = new ManagedDotNetPluginLoader(); await l1.LoadInProcessAsync(pathA, TypeName);
+            var l2 = new ManagedDotNetPluginLoader(); await l2.LoadInProcessAsync(pathB, TypeName);
+            Check("iki kopyanın Type nesneleri FARKLI (ayrı context'ler)", l1.Builder!.Type != l2.Builder!.Type);
+            l1.Builder.SetValue("Counter", 100);
+            Check("state paylaşılmıyor", l2.Builder.GetValue<int>("Counter") == 0);
+            Check("aynı AssemblyQualifiedName'e rağmen EvokerBuilder cache'i karışmıyor",
+                l1.Builder.Invoke<int>("Increment") == 101 && l2.Builder.Invoke<int>("Increment") == 1);
+            if (depV2 != null)
+            {
+                string d1 = l1.Builder.Invoke<string>("UseDependency")!, d2 = l2.Builder.Invoke<string>("UseDependency")!;
+                Check("kopya A kendi SampleDep v1'ini, kopya B kendi v2'sini kullanıyor", d1 == "SampleDep v1" && d2 == "SampleDep v2", $"{d1} / {d2}");
+            }
+            else Console.WriteLine("  [ATLANDI] sürüm izolasyonu (SampleDep v2 yolu verilmedi)");
+            Check("A boşaltıldı", await l1.UnloadAsync());
+            Check("A boşaldıktan sonra B hâlâ çalışıyor", l2.Builder!.Invoke<int>("Add", 1, 1) == 2);
+            Check("B boşaltıldı", await l2.UnloadAsync());
+
+            Console.WriteLine("\n=== 5) 20 kez yükle/kullan/boşalt -> sızıntı yok ===");
+            int okCount = 0;
+            for (int i = 0; i < 20; i++)
+            {
+                var l = await LoadAndUseAsync(pathA, (_, ok, _) => { if (!ok) failures++; });
+                if (await l.UnloadAsync()) okCount++;
+            }
+            Check("20/20 boşaltma başarılı", okCount == 20, $"{okCount}/20");
+            Check("döngü sonunda bellekte plugin context'i kalmadı", PluginContextCount() == 0, PluginContextCount().ToString());
+
+            Console.WriteLine("\n=== 6) EvokerEngine.ResolveType ve plugin tipleri ===");
+            var rl = new ManagedDotNetPluginLoader(); await rl.LoadInProcessAsync(pathA, TypeName);
+            Check("ResolveType plugin tipini buluyor", EvokerEngine.ResolveType(TypeName) == rl.Builder!.Type);
+            var rl2 = new ManagedDotNetPluginLoader(); await rl2.LoadInProcessAsync(pathB, TypeName);
+            try { EvokerEngine.ResolveType("SamplePlugin"); Check("iki kopya yüklüyken kısa ad -> AmbiguousMatchException", false); }
+            catch (System.Reflection.AmbiguousMatchException) { Check("iki kopya yüklüyken kısa ad -> AmbiguousMatchException (rastgele seçmiyor)", true); }
+            Check("ResolveType cache'i ikinci kopyanın unload'unu ENGELLEMİYOR", await rl2.UnloadAsync());
+            Check("ResolveType cache'i birinci kopyanın unload'unu ENGELLEMİYOR", await rl.UnloadAsync());
+            var rl3 = new ManagedDotNetPluginLoader(); await rl3.LoadInProcessAsync(pathA, TypeName);
+            Check("reload sonrası ResolveType YENİ tipi döndürüyor (eski cache'ten değil)", EvokerEngine.ResolveType(TypeName) == rl3.Builder!.Type);
+            Check("son kopya da boşaltıldı", await rl3.UnloadAsync());
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM UNLOAD TESTLERİ GEÇTİ." : $"{failures} TEST BAŞARISIZ.");
+            //return failures == 0 ? 0 : 1;
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            static async Task<ManagedDotNetPluginLoader> LoadAndHoldAsync(string path, Holder holder)
+            {
+                var loader = new ManagedDotNetPluginLoader();
+                await loader.LoadInProcessAsync(path, "TestPlugin.SamplePlugin");
+                holder.Builder = loader.Builder!.AsPluginBuilder();
+                holder.Builder.Invoke<int>("Add", 1, 1);
+                return loader;
+            }
+
+            // --- Ön kontrol: verilen SamplePlugin.dll bu test kitiyle aynı sürüm mü? ---
+            // (Eski bir build verilirse testler anlaşılmaz "metot bulunamadı" hatalarıyla kesiliyordu.)
+            static bool PreflightSamplePlugin(string dll)
+            {
+                var scan = DSO.Core.Evoker.Plugins.Scanning.PluginScanner.Scan(dll);
+                var t = scan.Types.FirstOrDefault(x => x.FullName == "TestPlugin.SamplePlugin");
+                var methods = t?.Methods.Select(m => m.Name).ToHashSet() ?? new HashSet<string>();
+                var events = t?.Events.Select(e => e.Name).ToHashSet() ?? new HashSet<string>();
+                var missing = new[] { "Add", "AddAsync", "MakePoint", "SlowAsync", "OptionalDemo", "UseDependency", "CheckedDivide", "RunWithProgress", "MoveTo", "Increment" }
+                    .Where(m => !methods.Contains(m))
+                    .Concat(new[] { "CounterChanged", "Progress", "PointMoved" }.Where(e => !events.Contains(e)).Select(e => "event " + e))
+                    .ToList();
+                if (missing.Count == 0) return true;
+                Console.WriteLine($"[ÖN KONTROL HATASI] Verilen SamplePlugin.dll bu test kitinden ESKİ: {dll}");
+                Console.WriteLine($"  Dosya tarihi: {File.GetLastWriteTime(dll):yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"  Eksik üyeler: {string.Join(", ", missing)}");
+                Console.WriteLine("  TestKit/SamplePlugin'i güncel SamplePlugin.cs + SamplePlugin.csproj (SampleDep referansı) ile yeniden derleyip");
+                Console.WriteLine("  testi o build çıktısındaki SamplePlugin.dll ile çalıştırın.");
+                return false;
+            }
+
+        }
+    }
+
+    public static class PerformansTesti
+    {
+        static string PluginsFolderPath = Path.Combine(AppContext.BaseDirectory, "Plugins");
+        static string HostFolderPath = Path.Combine(AppContext.BaseDirectory, "Host");
+        static string dllPath = Path.Combine(PluginsFolderPath, "SamplePlugin.dll"); //args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli.");
+        static string hostDllPath = Path.Combine(HostFolderPath, "DSO.Core.Evoker.PluginHost.dll"); //args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli.");
+
+
+        // Performans karşılaştırması: aynı işlem (SamplePlugin.Add(int,int)) her katmandan çağrılır; çağrı başına süre
+        // (ns/op) ve çağrı başına bellek ayırma (B/op) ölçülür. Ayrıca sandbox'a özgü senaryolar (paralellik, toplu
+        // çağrı, büyük metin, complex nesne) ve başlatma maliyetleri.
+        //
+        // Kullanım (Release ile!): dotnet run -c Release -- <SamplePlugin.dll yolu> <DSO.Core.Evoker.PluginHost.dll yolu>
+        // NOT: Mutlak sayılar makineye/işletim sistemine bağlı (özellikle sandbox: Windows named pipe ile Linux Unix
+        // soket farklı). Karşılaştırma için önemli olan katmanlar ARASINDAKİ oranlar.
+
+        public static async Task TestRun()
+        {
+            string dll = dllPath; //Path.GetFullPath(args.Length > 0 ? args[0] : throw new ArgumentException("SamplePlugin.dll yolu gerekli."));
+            string host = hostDllPath; //Path.GetFullPath(args.Length > 1 ? args[1] : throw new ArgumentException("PluginHost.dll yolu gerekli."));
+            const string T = "TestPlugin.SamplePlugin";
+            var results = new List<(string Group, string Name, double Ns, double Bytes, string Note)>();
+
+#if DEBUG
+            Console.WriteLine("UYARI: DEBUG build - sonuçlar anlamsız olur, -c Release ile çalıştırın.");
+#endif
+
+            // ---------------- ölçüm yardımcıları ----------------
+            (double ns, double bytes) Measure(int iterations, Action body)
+            {
+                for (int i = 0; i < Math.Max(200, iterations / 10); i++) body(); // ısınma (JIT + cache'ler)
+                var samples = new List<(double, double)>();
+                for (int round = 0; round < 3; round++)
+                {
+                    GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+                    long a0 = GC.GetTotalAllocatedBytes(true);
+                    var sw = Stopwatch.StartNew();
+                    for (int i = 0; i < iterations; i++) body();
+                    sw.Stop();
+                    long a1 = GC.GetTotalAllocatedBytes(true);
+                    samples.Add((sw.Elapsed.TotalMilliseconds * 1e6 / iterations, (a1 - a0) / (double)iterations));
+                }
+                return samples.OrderBy(s => s.Item1).ElementAt(1); // 3 turun medyanı
+            }
+
+            async Task<(double ns, double bytes)> MeasureAsync(int iterations, Func<Task> body)
+            {
+                for (int i = 0; i < Math.Max(100, iterations / 10); i++) await body();
+                var samples = new List<(double, double)>();
+                for (int round = 0; round < 3; round++)
+                {
+                    GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+                    long a0 = GC.GetTotalAllocatedBytes(true);
+                    var sw = Stopwatch.StartNew();
+                    for (int i = 0; i < iterations; i++) await body();
+                    sw.Stop();
+                    long a1 = GC.GetTotalAllocatedBytes(true);
+                    samples.Add((sw.Elapsed.TotalMilliseconds * 1e6 / iterations, (a1 - a0) / (double)iterations));
+                }
+                return samples.OrderBy(s => s.Item1).ElementAt(1);
+            }
+
+            void Add(string group, string name, (double ns, double bytes) r, string note = "")
+            {
+                results.Add((group, name, r.ns, r.bytes, note));
+                Console.WriteLine($"  {name,-62} {Fmt(r.ns),12}  {r.bytes,8:0} B/op  {note}");
+            }
+
+            static string Fmt(double ns) => ns < 1_000 ? $"{ns:0.0} ns" : ns < 1_000_000 ? $"{ns / 1000:0.00} µs" : $"{ns / 1_000_000:0.00} ms";
+
+            async Task<double> TimeMs(Func<Task> a)
+            {
+                var sw = Stopwatch.StartNew();
+                await a();
+                return sw.Elapsed.TotalMilliseconds;
+            }
+
+            // =====================================================================================
+            Console.WriteLine("=== A) In-process çağrı yolları: Add(int,int) ===");
+            var loader = new ManagedDotNetPluginLoader();
+            await loader.LoadInProcessAsync(dll, T);
+            var eb = loader.Builder!;
+            var inst = loader.Instance!;
+            var addMi = eb.Type.GetMethod("Add")!;
+            var typed = (Func<int, int, int>)addMi.CreateDelegate(typeof(Func<int, int, int>), inst);
+            int x = 0;
+            const int N = 1_000_000;
+
+            Add("A", "A1 Derlenmiş tipli delegate (en hızlı referans noktası)", Measure(N * 5, () => x = typed(x & 1023, 1)));
+            Add("A", "A2 MethodInfo.Invoke (düz reflection)", Measure(N, () => x = (int)addMi.Invoke(inst, new object[] { x & 1023, 1 })!));
+            Add("A", "A3 EvokerBuilder.Invoke<int>(\"Add\", a, b)", Measure(N, () => x = eb.Invoke<int>("Add", x & 1023, 1)));
+            var ebFunc = eb.GetFunc<int>("Add", new object[] { 0, 0 });
+            Add("A", "A4 EvokerBuilder.GetFunc<int> (önceden çözülmüş)", Measure(N, () => x = ebFunc(new object[] { x & 1023, 1 })));
+            Add("A", "A5 InvokeDynamicAsync (dönüş şekli bilinmeyen köprü)", Measure(N / 2, () => x = (int)eb.InvokeDynamicAsync("Add", new object?[] { x & 1023, 1 }).GetAwaiter().GetResult()!));
+            IPluginBuilder ipb = eb.AsPluginBuilder();
+            Add("A", "A6 IPluginBuilder (in-process).Invoke<int>", Measure(N / 2, () => x = ipb.Invoke<int>("Add", x & 1023, 1)));
+            Add("A", "A7 IPluginBuilder (in-process).InvokeAsync<int> (await)", await MeasureAsync(N / 2, async () => x = await ipb.InvokeAsync<int>("Add", x & 1023, 1)));
+            var ipbFunc = ipb.GetFunc<int>("Add", new object?[] { 0, 0 });
+            Add("A", "A8 IPluginBuilder (in-process).GetFunc<int>", Measure(N, () => x = ipbFunc(new object?[] { x & 1023, 1 })));
+            var batchArgs = Enumerable.Range(0, 10_000).Select(i => new object?[] { i, 1 }).ToList();
+            var rb = await MeasureAsync(20, async () => await ipb.InvokeBatchAsync<int>("Add", batchArgs));
+            Add("A", "A9 IPluginBuilder (in-process).InvokeBatchAsync (çağrı başına)", (rb.ns / batchArgs.Count, rb.bytes / batchArgs.Count));
+
+            Console.WriteLine("\n=== B) In-process property/field: Counter (int field) ===");
+            var fieldInfo = eb.Type.GetField("Counter")!;
+            Add("B", "B1 FieldInfo.GetValue (düz reflection)", Measure(N, () => x = (int)fieldInfo.GetValue(inst)!));
+            var getter = DynamicEntityAccessor.GetGetter<int>(eb.Type, "Counter");
+            Add("B", "B2 DynamicEntityAccessor getter delegate (önceden alınmış)", Measure(N * 5, () => x = getter(inst)));
+            Add("B", "B3 EvokerBuilder.GetValue<int>(\"Counter\")", Measure(N, () => x = eb.GetValue<int>("Counter")));
+            Add("B", "B4 IPluginBuilder (in-process).GetValue<int>", Measure(N, () => x = ipb.GetValue<int>("Counter")));
+            Add("B", "B5 EvokerBuilder.SetValue<int>(\"Counter\", v)", Measure(N, () => eb.SetValue("Counter", x & 1023)));
+            Add("B", "B6 IPluginBuilder (in-process).SetValue<int>", Measure(N, () => ipb.SetValue("Counter", x & 1023)));
+
+            Console.WriteLine("\n=== C) Complex nesne (Point) - in-process ===");
+            Add("C", "C1 Invoke<PointDto>(\"MakePoint\") (plugin Point -> host DTO, JSON eşleme)", Measure(N / 10, () => ipb.Invoke<PointDto>("MakePoint", 1, 2)));
+            var dto = new PointDto { X = 2, Y = 3 };
+            Add("C", "C2 Invoke<int>(\"SumPoint\", PointDto) (host DTO -> plugin Point)", Measure(N / 10, () => x = ipb.Invoke<int>("SumPoint", dto)));
+
+            Console.WriteLine("\n=== D) PluginManager proxy (SwitchablePluginBuilder) - in-process modda ===");
+            string cfg = Path.Combine(Path.GetTempPath(), "perf-plugins-" + Guid.NewGuid().ToString("N")[..6] + ".json");
+            await using var mgr = new PluginManager(new JsonFilePluginConfigStore(cfg), new PluginManagerOptions { HostPath = host, NotifyOnCrash = false });
+            await mgr.InitializeAsync();
+            await mgr.RegisterAsync(new PluginRegistration { Id = "perf-in", FilePath = dll, TypeFullName = T, Mode = PluginExecutionMode.InProcess });
+            var proxy = mgr.Get("perf-in");
+            proxy.Invoke<int>("Add", 1, 1);
+            Add("D", "D1 proxy.Invoke<int>", Measure(N / 2, () => x = proxy.Invoke<int>("Add", x & 1023, 1)));
+            var proxyFunc = proxy.GetFunc<int>("Add", new object?[] { 0, 0 });
+            Add("D", "D2 proxy.GetFunc<int>", Measure(N, () => x = proxyFunc(new object?[] { x & 1023, 1 })));
+            Add("D", "D3 proxy.GetValue<int>", Measure(N / 2, () => x = proxy.GetValue<int>("Counter")));
+
+            // =====================================================================================
+            Console.WriteLine("\n=== E) Sandbox (ayrı worker process, named pipe) ===");
+            var opts = new PluginWorkerOptions { HostPath = host, MaxConcurrency = 1, NotifyOnCrash = false, HeartbeatIntervalMs = 5000 };
+            await using var h = new PluginWorkerHandle(dll, T, opts);
+            await h.StartAsync();
+            IPluginBuilder sb = h.Builder;
+            const int S = 5_000;
+            Add("E", "E1 sandbox Invoke<int> (senkron, tek tek)", Measure(S, () => x = sb.Invoke<int>("Add", x & 1023, 1)));
+            Add("E", "E2 sandbox InvokeAsync<int> (await, tek tek)", await MeasureAsync(S, async () => x = await sb.InvokeAsync<int>("Add", x & 1023, 1)));
+            var sbFunc = sb.GetFunc<int>("Add", new object?[] { 0, 0 });
+            Add("E", "E3 sandbox GetFunc<int>", Measure(S, () => x = sbFunc(new object?[] { x & 1023, 1 })));
+            int rawHandle = await h.ResolveAsync(T, "Add", new[] { WireTypeCode.Int32, WireTypeCode.Int32 });
+            var w1 = WireValueCodec.FromObject(1);
+            Add("E", "E4 en alt seviye: handle.InvokeAsync(handle, WireValue[])", await MeasureAsync(S, async () => await h.InvokeAsync(rawHandle, new[] { w1, w1 })));
+            var sbBatch = await MeasureAsync(10, async () => await sb.InvokeBatchAsync<int>("Add", batchArgs));
+            Add("E", "E5 sandbox InvokeBatchAsync (çağrı başına, 10.000'lik)", (sbBatch.ns / batchArgs.Count, sbBatch.bytes / batchArgs.Count));
+            Add("E", "E6 sandbox GetValue<int>(\"Counter\")", Measure(S, () => x = sb.GetValue<int>("Counter")));
+            Add("E", "E7 sandbox SetValue<int>", Measure(S, () => sb.SetValue("Counter", x & 1023)));
+            Add("E", "E8 sandbox Invoke<PointDto>(\"MakePoint\") (Complex dönüş)", Measure(S / 2, () => sb.Invoke<PointDto>("MakePoint", 1, 2)));
+            Add("E", "E9 sandbox Invoke<int>(\"SumPoint\", PointDto) (Complex argüman)", Measure(S / 2, () => x = sb.Invoke<int>("SumPoint", dto)));
+            string big = new string('x', 100_000);
+            var rBig = Measure(300, () => sb.Invoke<string>("Greet", big, "Merhaba"));
+            Add("E", "E10 sandbox Greet(100 KB metin) - gidiş + dönüş", rBig, $"≈ {200_000 / (rBig.ns / 1e9) / 1_048_576:0} MB/s");
+
+            Console.WriteLine("\n=== F) Sandbox paralellik: 4 eşzamanlı çağıran, toplam 8.000 Add ===");
+            async Task<double> Parallel(int maxConcurrency)
+            {
+                await using var ph = new PluginWorkerHandle(dll, T, new PluginWorkerOptions { HostPath = host, MaxConcurrency = maxConcurrency, NotifyOnCrash = false });
+                await ph.StartAsync();
+                var f = ph.Builder.GetFuncAsync<int>("Add");
+                for (int i = 0; i < 500; i++) await f(new object?[] { i, 1 });
+                var sw = Stopwatch.StartNew();
+                await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(async () => { for (int i = 0; i < 2000; i++) await f(new object?[] { i, 1 }); })));
+                return 8000 / sw.Elapsed.TotalSeconds;
+            }
+            double p1 = await Parallel(1), p4 = await Parallel(4);
+            Console.WriteLine($"  MaxConcurrency=1: {p1:0} çağrı/sn   |   MaxConcurrency=4: {p4:0} çağrı/sn");
+            results.Add(("F", "F1 4 çağıran, MaxConcurrency=1 (çağrı/sn)", p1, 0, ""));
+            results.Add(("F", "F2 4 çağıran, MaxConcurrency=4 (çağrı/sn)", p4, 0, ""));
+
+            // =====================================================================================
+            Console.WriteLine("\n=== G) Başlatma / yönetim maliyetleri (ortalama) ===");
+            double loadMs = 0, unloadMs = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                var l = new ManagedDotNetPluginLoader();
+                loadMs += await TimeMs(() => l.LoadInProcessAsync(dll, T));
+                l.Builder!.Invoke<int>("Add", 1, 1);
+                unloadMs += await TimeMs(async () => await l.UnloadAsync());
+            }
+            Console.WriteLine($"  In-process yükleme (context + ctor): {loadMs / 5:0.0} ms   |   UnloadAsync (cache temizliği + GC doğrulama): {unloadMs / 5:0.0} ms");
+            double startMs = 0, stopMs = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                var sh = new PluginWorkerHandle(dll, T, opts);
+                startMs += await TimeMs(() => sh.StartAsync());
+                stopMs += await TimeMs(async () => await sh.DisposeAsync());
+            }
+            Console.WriteLine($"  Sandbox worker başlatma (process + pipe + Hello): {startMs / 3:0} ms   |   kapatma: {stopMs / 3:0} ms");
+            double scanMs = await TimeMs(() => { PluginScanner.Scan(dll); return Task.CompletedTask; });
+            double descMs = await TimeMs(() => { PluginInspector.Describe(dll, T); return Task.CompletedTask; });
+            double descValMs = await TimeMs(async () => await ipb.DescribeAsync(true));
+            double descSbMs = await TimeMs(async () => await sb.DescribeAsync(true));
+            Console.WriteLine($"  PluginScanner.Scan: {scanMs:0.0} ms | PluginInspector.Describe (yapı): {descMs:0.0} ms | DescribeAsync+değerler: in-process {descValMs:0.0} ms, sandbox {descSbMs:0.0} ms");
+            // Not: plugin şu an iki context'te yüklü (loader + manager) -> kısa/tam ad belirsiz (doğru davranış, AmbiguousMatchException).
+            // Cache isabetini tekil bir host tipiyle ölçüyoruz.
+            var rt = Measure(N, () => EvokerEngine.ResolveType("PointDto"));
+            Console.WriteLine($"  EvokerEngine.ResolveType cache isabeti: {Fmt(rt.ns)} ({rt.bytes:0} B/op)");
+            var missSw = Stopwatch.StartNew();
+            try { EvokerEngine.ResolveType("OlmayanTip_" + Guid.NewGuid().ToString("N")); } catch (TypeLoadException) { }
+            Console.WriteLine($"  EvokerEngine.ResolveType ıska (tüm assembly'leri tarar): {missSw.Elapsed.TotalMilliseconds:0.0} ms");
+
+            await loader.UnloadAsync();
+            File.Delete(cfg);
+
+            Console.WriteLine("\n=== ÖZET (A1'e göre oran) ===");
+            double baseNs = results.First(r => r.Name.StartsWith("A1")).Ns;
+            foreach (var r in results.Where(r => r.Group != "F"))
+                Console.WriteLine($"  {r.Name,-62} {Fmt(r.Ns),12} {r.Bytes,8:0} B   x{r.Ns / baseNs,10:0.0}");
 
         }
     }
@@ -1214,6 +1928,10 @@ namespace DSO.Core.Evoker.Plugins.TestApi
         public int X { get; set; }
         public int Y { get; set; }
     }
+
+    public sealed class Holder { public IPluginBuilder? Builder; }
 }
+
+
 
 

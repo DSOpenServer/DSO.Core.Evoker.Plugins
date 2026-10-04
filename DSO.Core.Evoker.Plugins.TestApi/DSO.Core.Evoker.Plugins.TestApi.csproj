@@ -21,6 +21,9 @@
     <Content Update="Host\DSO.Core.Evoker.PluginHost.runtimeconfig.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <Content Update="Plugins\depv2\SampleDep.deps.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
     <Content Update="Plugins\SamplePlugin.deps.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
@@ -61,6 +64,12 @@
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
     <None Update="Host\System.Reflection.MetadataLoadContext.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Plugins\depv2\SampleDep.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Plugins\depv2\SampleDep.pdb">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
     <None Update="Plugins\SampleDep.dll">

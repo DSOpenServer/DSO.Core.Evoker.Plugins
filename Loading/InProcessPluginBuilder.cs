@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Threading.Tasks;
 using DSO.Core.Evoker;
 using DSO.Core.Evoker.Plugins.Sandbox;
+using DSO.Core.Evoker.Plugins.Scanning;
 
 namespace DSO.Core.Evoker.Plugins.Loading
 {
@@ -165,6 +166,16 @@ namespace DSO.Core.Evoker.Plugins.Loading
 
         /// <summary>Bkz. PluginWorkerHandle.EventHandlerFailed - aynı sözleşme.</summary>
         public event Action<PluginEventArgs, Exception>? EventHandlerFailed;
+
+        // --- Tanım ---
+
+        public async Task<PluginDescriptor> DescribeAsync(bool includeValues = true)
+        {
+            // Yapı, çalışan tipten DEĞİL dosyadan (MetadataLoadContext) okunur - sandbox ile birebir aynı çıktı.
+            var d = PluginInspector.Describe(Builder.Type.Assembly.Location, TypeFullName);
+            if (includeValues) await PluginValueSnapshot.CaptureAsync(d, this).ConfigureAwait(false);
+            return d;
+        }
 
         // --- Cache ---
 

@@ -214,7 +214,19 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 throw new InvalidOperationException($"[PluginWorkerHandle] Beklenen ilk mesaj Hello, gelen: {helloType}.");
             }
 
-            var (success, _, error) = IpcMessageCodec.DecodeHello(helloPayload);
+            var (success, _, error, workerProtocol) = IpcMessageCodec.DecodeHelloWithVersion(helloPayload);
+            if (workerProtocol != IpcProtocol.Version)
+            {
+                KillQuietly(process);
+                pipeServer.Dispose();
+                string hostFile = Options.HostPath;
+                string stamp = File.Exists(hostFile) ? File.GetLastWriteTime(hostFile).ToString("yyyy-MM-dd HH:mm:ss") : "?";
+                throw new InvalidOperationException(
+                    $"[PluginWorkerHandle] PluginHost sürümü uyumsuz: worker protokol v{workerProtocol}, bu kütüphane v{IpcProtocol.Version}. " +
+                    $"HostPath '{hostFile}' (dosya tarihi {stamp}) muhtemelen ESKİ bir build - DSO.Core.Evoker.PluginHost projesini " +
+                    "yeniden derleyin ve HostPath'i o build çıktısına yönlendirin." +
+                    (success ? "" : $" (Worker ayrıca şunu bildirdi: {error})"));
+            }
             if (!success)
             {
                 KillQuietly(process);

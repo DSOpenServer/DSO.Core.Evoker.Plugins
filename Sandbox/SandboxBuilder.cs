@@ -224,6 +224,15 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             return _eventNames = type?.Events.Select(e => e.Name).Distinct().ToArray() ?? Array.Empty<string>();
         }
 
+        // --- Tanım ---
+
+        public async Task<Scanning.PluginDescriptor> DescribeAsync(bool includeValues = true)
+        {
+            var d = Scanning.PluginInspector.Describe(_handle.PluginFilePath, TypeFullName);
+            if (includeValues) await Scanning.PluginValueSnapshot.CaptureAsync(d, this).ConfigureAwait(false);
+            return d;
+        }
+
         // --- Cache ---
 
         public async Task ForgetCacheAsync()

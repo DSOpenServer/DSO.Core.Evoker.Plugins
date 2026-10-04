@@ -86,22 +86,37 @@ namespace DSO.Core.Evoker.Plugins.Management
         public PluginRegistration GetRegistrationCopy(string id) => GetSlot(id).Registration.Clone();
 
         /// <summary>
-        /// Yeni plugin kaydı. DLL çalıştırılmadan doğrulanır: .NET assembly'si mi, tip gerçekten içinde mi.
-        /// Aynı Id varsa hata (değiştirmek için UpdateAsync).
+        /// Yeni plugin kaydı. DLL çalıştırılmadan doğrulanır (.NET assembly'si mi, tip içinde mi).
+        /// Id verilmezse GUID üretilir (bir kez, kalıcı). Aynı DLL + tip farklı Id'lerle tekrar eklenebilir.
+        /// Aynı Id zaten varsa, dosya/tip bulunamazsa: exception YOK - Success=false + mesaj, kayıt eklenmez.
         /// </summary>
-        public async Task RegisterAsync(PluginRegistration registration)
+        public async Task<PluginRegistrationResult> RegisterAsync(PluginRegistration registration)
         {
             EnsureInitialized();
             if (registration == null) throw new ArgumentNullException(nameof(registration));
-            if (string.IsNullOrWhiteSpace(registration.Id)) throw new ArgumentException("Id boş olamaz.");
-            Validate(registration);
 
             var reg = registration.Clone();
+            reg.Id = string.IsNullOrWhiteSpace(reg.Id) ? Guid.NewGuid().ToString("N") : reg.Id.Trim();
+            if (_slots.TryGetValue(reg.Id, out var existing))
+                return PluginRegistrationResult.Fail(
+                    $"'{reg.Id}' adı zaten kullanılıyor ({existing.Registration.DisplayName}) - kayıt eklenmedi. Farklı bir ad verin ya da mevcut kaydı UpdateAsync ile değiştirin.",
+                    reg.Id);
+
+            var error = ValidationError(reg);
+            if (error != null)
+                return PluginRegistrationResult.Fail(error + " - kayıt eklenmedi.", reg.Id);
+
             reg.FilePath = Path.GetFullPath(reg.FilePath);
             reg.UpdatedUtc = DateTime.UtcNow;
             if (!_slots.TryAdd(reg.Id, new Slot(reg)))
-                throw new InvalidOperationException($"'{reg.Id}' zaten kayıtlı - değiştirmek için UpdateAsync kullanın.");
+                return PluginRegistrationResult.Fail($"'{reg.Id}' adı aynı anda başka bir kayıtla eklendi - kayıt eklenmedi.", reg.Id);
+
             await SaveAsync().ConfigureAwait(false);
+            int sameTypeCount = _slots.Values.Count(x =>
+                string.Equals(x.Registration.FilePath, reg.FilePath, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(x.Registration.TypeFullName, reg.TypeFullName, StringComparison.OrdinalIgnoreCase));
+            return PluginRegistrationResult.Ok(reg.Id,
+                sameTypeCount > 1 ? $"{reg.DisplayName} eklendi (bu plugin'in {sameTypeCount}. örneği)." : $"{reg.DisplayName} eklendi.");
         }
 
         /// <summary>
@@ -217,6 +232,23 @@ namespace DSO.Core.Evoker.Plugins.Management
 
         /// <summary>Plugin DLL'ini ÇALIŞTIRMADAN tarar (metotlar, property/field'lar, event'ler) - admin ekranı için.</summary>
         public PluginScanResult Scan(string id) => PluginScanner.Scan(GetSlot(id).Registration.FilePath);
+
+        /// <summary>
+        /// Kayıtlı plugin tipinin tam tanımı (bkz. PluginDescriptor; JSON için .ToJson()). Plugin ÇALIŞIYORSA ve
+        /// includeValues=true ise field/property'lerin o anki değerleri de eklenir; çalışmıyorsa SADECE yapı döner
+        /// (sadece değer okumak için plugin başlatılmaz) ve Warnings'te belirtilir.
+        /// </summary>
+        public async Task<PluginDescriptor> DescribeAsync(string id, bool includeValues = true)
+        {
+            var slot = GetSlot(id);
+            if (includeValues && slot.Inner != null && slot.Proxy != null)
+                return await slot.Proxy.DescribeAsync(includeValues: true).ConfigureAwait(false);
+
+            var d = PluginInspector.Describe(slot.Registration.FilePath, slot.Registration.TypeFullName,
+                new PluginDescribeOptions { IncludeNonPublic = true });
+            if (includeValues) d.AddWarning("Plugin şu an çalışmıyor - değerler alınmadı (sadece yapı).");
+            return d;
+        }
 
         public PluginStatus GetStatus(string id)
         {
@@ -364,18 +396,26 @@ namespace DSO.Core.Evoker.Plugins.Management
             }
         }
 
+        // UpdateAsync gibi kodun doğrudan çağırdığı yerlerde exception; RegisterAsync'te mesaj olarak döner.
         private static void Validate(PluginRegistration reg)
         {
+            var error = ValidationError(reg);
+            if (error != null) throw new ArgumentException(error);
+        }
+
+        private static string? ValidationError(PluginRegistration reg)
+        {
             if (string.IsNullOrWhiteSpace(reg.FilePath) || !File.Exists(reg.FilePath))
-                throw new FileNotFoundException($"Plugin dosyası bulunamadı: {reg.FilePath}", reg.FilePath);
+                return $"Plugin dosyası bulunamadı: {reg.FilePath}";
             if (string.IsNullOrWhiteSpace(reg.TypeFullName))
-                throw new ArgumentException("TypeFullName boş olamaz.");
+                return "TypeFullName boş olamaz.";
 
             var scan = PluginScanner.Scan(reg.FilePath);
             if (scan.Kind != PluginKind.ManagedDotNet)
-                throw new NotSupportedException($"'{reg.FilePath}' bir .NET assembly'si değil ({scan.Kind}) - şu an sadece managed plugin'ler destekleniyor.");
+                return $"'{reg.FilePath}' bir .NET assembly'si değil ({scan.Kind}) - şu an sadece managed plugin'ler destekleniyor.";
             if (!scan.Types.Any(t => string.Equals(t.FullName, reg.TypeFullName, StringComparison.OrdinalIgnoreCase)))
-                throw new TypeLoadException($"'{reg.TypeFullName}' tipi '{reg.FilePath}' içinde bulunamadı (ya da public değil).");
+                return $"'{reg.TypeFullName}' tipi '{reg.FilePath}' içinde bulunamadı (ya da public değil).";
+            return null;
         }
 
         private void RaiseModeChanged(string id, PluginExecutionMode mode)
