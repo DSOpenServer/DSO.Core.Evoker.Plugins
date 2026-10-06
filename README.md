@@ -4,7 +4,7 @@
 
 ![.NET](https://img.shields.io/badge/.NET-6.0%20%7C%208.0-512BD4) ![Testler](https://img.shields.io/badge/test-500%2B%20kontrol-success) ![Unload](https://img.shields.io/badge/unload-do%C4%9Fruland%C4%B1-brightgreen)
 
-`DSO.Core.Evoker.Plugins`, [DSO.Core.Evoker](../DSO.Core.Evoker/README.md) çekirdeğinin üzerine kurulu, üretim için
+`DSO.Core.Evoker.Plugins`, [DSO.Core.Evoker](https://github.com/DSOpenServer/DSO.Core.Evoker/blob/main/README.md) çekirdeğinin üzerine kurulu, üretim için
 tasarlanmış bir plugin altyapısıdır. Plugin'leriniz özel bir arayüz uygulamak, attribute taşımak ya da bu kütüphaneye
 referans vermek **zorunda değildir**. Sıradan bir sınıf kütüphanesi yeterlidir: C#, VB.NET, eski ya da yeni, sizin ya da
 üçüncü partinin.
