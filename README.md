@@ -62,7 +62,7 @@ Bunların üstüne:
   başlarsa abonelik kendiliğinden yenilenir.
 - **Toplu çağrı:** sandbox'ta 10.000 çağrı tek mesajda gider. Çağrı başına maliyet **~95 µs'den ~0.7 µs'ye** iner.
 - **JSON komutlar worker'ın içinde çalışır:** sandbox ve in-process modlar aynı JSON sonucunu üretir. Web'e açmak için
-  [DSO.Core.Evoker.Plugins.Api](../DSO.Core.Evoker.Plugins.Api/README.md) yeterlidir.
+  [DSO.Core.Evoker.Plugins.Api](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins.Api/blob/main/README.md) yeterlidir.
 - **DLL çalıştırılmadan tarama:** tipler, imzalar, varsayılan değerler ve hazır komut şablonları DLL yüklenmeden
   MetadataLoadContext ile okunur. Güvenmediğiniz bir DLL'i incelemek de güvenlidir.
 
@@ -127,7 +127,7 @@ Optimizasyon turundaki iyileşmeler:
 
 | Bağımlılık | Not |
 |---|---|
-| [DSO.Core.Evoker](../DSO.Core.Evoker/README.md) | Çekirdek |
+| [DSO.Core.Evoker](https://github.com/DSOpenServer/DSO.Core.Evoker/blob/main/README.md) | Çekirdek |
 | `DSO.Core.SchemaBinarySerializer` | System.Text.Json'ın taşıyamadığı karmaşık değerler için ikinci format |
 | `System.Reflection.MetadataLoadContext` (NuGet) | DLL'i çalıştırmadan tarama |
 | `DSO.Core.Evoker.PluginHost` | Sandbox worker exe'si; sadece Sandbox modu için ([dağıtım](#pluginhost-worker-dağıtımı)) |
@@ -501,7 +501,7 @@ await PluginValueSnapshot.CaptureAsync(d, builder);   // çalışan instance'tan
 - **`Assembly`:** `Name`, `Version`, `FileVersion`, `InformationalVersion`, `TargetFramework`, `FilePath`, `FileSize`,
   `LastWriteUtc`, `Sha256`, `References`.
 - **`Type`:** çekirdeğin `EvokerTypeDescriptor`'ı. Ayrıntılar için
-  [Description](../DSO.Core.Evoker/README.md#description--tip-tanımı-ve-şablonlar).
+  [Description](https://github.com/DSOpenServer/DSO.Core.Evoker/blob/main/README.md#description--tip-tanımı-ve-şablonlar).
 
 Bunlara `Values` ve `Warnings` eklenir. Örnek çıktı: `TestKit/ornek-plugin-tanimi.json`.
 
@@ -645,7 +645,7 @@ object? c = WireValueCodec.ConvertTo(jsonElement, typeof(int));
 | `MissingMemberException` | `GetValue`/`SetValue` için property ya da field yok |
 
 JSON komutlar exception fırlatmaz; aynı durumlar `EvokerErrorCodes` ile döner
-([tablo](../DSO.Core.Evoker/README.md#sonuç-ve-hata-modeli)).
+([tablo](https://github.com/DSOpenServer/DSO.Core.Evoker/blob/main/README.md#sonuç-ve-hata-modeli)).
 
 ---
 
@@ -657,7 +657,7 @@ JSON komutlar exception fırlatmaz; aynı durumlar `EvokerErrorCodes` ile döner
 <pipeAdı> <pluginDosyası> <tipTamAdı> <includeNonPublic:true|false> <maxConcurrency>
 ```
 
-Önerilen düzen ([Plugins.Api](../DSO.Core.Evoker.Plugins.Api/README.md) bunu kendiliğinden kurar):
+Önerilen düzen ([Plugins.Api](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins.Api/blob/main/README.md) bunu kendiliğinden kurar):
 
 ```
 <uygulama klasörü>/
@@ -701,7 +701,7 @@ Gerçekçi örnek plugin'ler için `DemoPlugins` klasörüne bakın:
 - **Rapor (C#):** pid ile izolasyon, timeout, çökme, özel exception.
 
 Bunları çalışır halde görmek için:
-[DSO.Core.Evoker.Plugins.Api → DemoApi](../DSO.Core.Evoker.Plugins.Api/README.md#demo-ve-testler).
+[DSO.Core.Evoker.Plugins.Api → DemoApi](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins.Api/blob/main/README.md#demo-ve-testler).
 
 ---
 
