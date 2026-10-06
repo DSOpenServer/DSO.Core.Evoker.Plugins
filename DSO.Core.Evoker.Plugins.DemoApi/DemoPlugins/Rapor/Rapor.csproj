@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Örnek plugin: Rapor (C#) - sandbox çökme / timeout / izolasyon senaryoları. Evoker'a hiçbir referansı YOK - sıradan bir sınıf kütüphanesi.
+    DemoApi derlenince bu proje de derlenir ve çıktısı DemoApi'nin bin klasöründe Plugins\Rapor\1.0\ altına kopyalanır.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>10</LangVersion>
+    <AssemblyName>Rapor</AssemblyName>
+    <RootNamespace>Rapor</RootNamespace>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+</Project>

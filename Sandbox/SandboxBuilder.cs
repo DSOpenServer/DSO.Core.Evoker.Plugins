@@ -214,6 +214,50 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             };
         }
 
+        // --- JSON komut (worker içinde çalışır) ---
+
+        public async Task<DSO.Core.Evoker.Commands.EvokerCommandResult> ExecuteCommandAsync(DSO.Core.Evoker.Commands.EvokerCommand command,
+            System.Threading.CancellationToken cancellationToken = default)
+        {
+            if (command == null) throw new ArgumentNullException(nameof(command));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            DSO.Core.Evoker.Commands.EvokerCommandResult result;
+            try
+            {
+                // Komutun kendi TimeoutMs'i worker'da uygulanır; host ayrıca DefaultTimeoutMs (+ küçük pay) kadar bekler.
+                int? wait = command.TimeoutMs.HasValue ? command.TimeoutMs + 2000 : DefaultTimeoutMs;
+                var task = _handle.ExecuteCommandAsync(command.ToJson(), wait);
+                var json = cancellationToken.CanBeCanceled ? await WithCancellation(task, cancellationToken).ConfigureAwait(false) : await task.ConfigureAwait(false);
+                result = DSO.Core.Evoker.Commands.EvokerCommandResult.FromJson(json);
+            }
+            catch (TimeoutException ex)
+            {
+                result = DSO.Core.Evoker.Commands.EvokerCommandResult.Fail(DSO.Core.Evoker.Commands.EvokerErrorCodes.Timeout, ex.Message);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                result = DSO.Core.Evoker.Commands.EvokerCommandResult.Fail(DSO.Core.Evoker.Commands.EvokerErrorCodes.Cancelled, "Komut iptal edildi (worker'da çalışmaya devam ediyor olabilir).");
+            }
+            catch (Exception ex)
+            {
+                // Worker çöktü / bağlantı koptu - plugin'in kendi hatası değil, ortam hatası.
+                result = DSO.Core.Evoker.Commands.EvokerCommandResult.Fail(DSO.Core.Evoker.Commands.EvokerErrorCodes.TargetException,
+                    $"Sandbox worker cevap veremedi: {ex.Message}", ex.GetType().FullName);
+            }
+            result.Mode = "Sandbox";
+            if (result.ElapsedMs <= 0) result.ElapsedMs = sw.Elapsed.TotalMilliseconds;
+            return result;
+        }
+
+        private static async Task<T> WithCancellation<T>(Task<T> task, System.Threading.CancellationToken ct)
+        {
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (ct.Register(() => tcs.TrySetResult(true)))
+                if (await Task.WhenAny(task, tcs.Task).ConfigureAwait(false) != task)
+                    throw new OperationCanceledException(ct);
+            return await task.ConfigureAwait(false);
+        }
+
         // --- Event'ler ---
 
         public async Task<IDisposable> SubscribeAsync(string eventName, Action<PluginEventArgs> handler)

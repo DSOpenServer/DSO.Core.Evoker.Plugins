@@ -42,33 +42,9 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 if (Involves(t, assembly)) SchemaSerializers.TryRemove(t, out _);
             foreach (var t in SchemaDeserializers.Keys)
                 if (Involves(t, assembly)) SchemaDeserializers.TryRemove(t, out _);
-            CompiledShapeMapper.ForgetAssembly(assembly, Involves);
             Volatile.Write(ref _jsonOptions, new JsonSerializerOptions());
-            ClearSystemTextJsonGlobalCaches();
-        }
-
-        // .NET 7+ System.Text.Json, aynı ayarlı options nesneleri arasında PAYLAŞILAN global statik cache'ler
-        // tutar (tip metadata'sı + derlenmiş üye erişimcileri). Yeni bir options nesnesi yaratmak bunları
-        // temizlemez - plugin tipleri orada kalır ve AssemblyLoadContext unload OLAMAZ (testte yakalandı).
-        // System.Text.Json bu cache'leri temizlemek için Hot Reload'a bir kanca sunar: assembly üzerindeki
-        // [MetadataUpdateHandler] tipinin static ClearCache(Type[]?) metodu. Aynı kancayı çağırıyoruz; bulunamazsa
-        // (farklı runtime sürümü) sessizce geçilir.
-        private static void ClearSystemTextJsonGlobalCaches()
-        {
-            try
-            {
-                var stj = typeof(JsonSerializer).Assembly;
-                foreach (var attr in stj.GetCustomAttributes<System.Reflection.Metadata.MetadataUpdateHandlerAttribute>())
-                {
-                    attr.HandlerType
-                        .GetMethod("ClearCache", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                        ?.Invoke(null, new object?[] { null });
-                }
-            }
-            catch
-            {
-                // Temizlik en iyi çaba ile yapılır; başarısızlık unload'u durdurmamalı (UnloadAsync false döner).
-            }
+            // Dönüştürücü (şekil eşleyici + JSON ayarları) çekirdekte - o da temizlenir; STJ global cache'leri de orada temizlenir.
+            DSO.Core.Evoker.Conversion.EvokerValueConverter.ForgetAssembly(assembly);
         }
 
         private static bool Involves(Type t, Assembly a) =>
@@ -157,12 +133,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         }
 
         /// <summary>WireTypeCode listesinde karşılığı olan (Complex OLMAYAN) bir tip mi - enum dahil (sayı olarak taşınır).</summary>
-        public static bool IsLeafType(Type t)
-        {
-            t = Nullable.GetUnderlyingType(t) ?? t;
-            return t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(decimal) || t == typeof(Guid)
-                || t == typeof(DateTime) || t == typeof(DateTimeOffset) || t == typeof(TimeSpan) || t == typeof(byte[]);
-        }
+        public static bool IsLeafType(Type t) => DSO.Core.Evoker.Conversion.EvokerValueConverter.IsLeafType(t);
 
         /// <summary>
         /// Tipli decode: Invoke&lt;T&gt;/GetValue&lt;T&gt; gibi çağıranın beklediği tipe çevirir.
@@ -173,37 +144,8 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         public static T? ToObject<T>(WireValue value) => (T?)ConvertTo(ToObject(value, typeof(T)), typeof(T));
 
         /// <summary>Bkz. ToObject&lt;T&gt; - tipi runtime'da bilinen çağıranlar için.</summary>
-        public static object? ConvertTo(object? value, Type targetType)
-        {
-            if (targetType == typeof(object) || targetType == typeof(void)) return value;
-            var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
-
-            if (value == null)
-                return targetType.IsValueType && Nullable.GetUnderlyingType(targetType) == null
-                    ? Activator.CreateInstance(targetType)
-                    : null;
-
-            if (targetType.IsInstanceOfType(value) || underlying.IsInstanceOfType(value)) return value;
-
-            if (value is JsonElement je)
-                return je.Deserialize(targetType, JsonOptions);
-
-            if (underlying.IsEnum)
-                return value is string es ? Enum.Parse(underlying, es, ignoreCase: true) : Enum.ToObject(underlying, value);
-
-            if (value is IConvertible && typeof(IConvertible).IsAssignableFrom(underlying))
-                return Convert.ChangeType(value, underlying, System.Globalization.CultureInfo.InvariantCulture);
-
-            // Aynı şekle sahip farklı tipler (ör. plugin Point ↔ host PointDto): derlenmiş kopyalayıcı - JSON ile
-            // aynı sonucu ~20-50 kat hızlı üretir; şekil emin olunamayacak kadar karmaşıksa null döner ve JSON'a düşülür.
-            var mapper = CompiledShapeMapper.Get(value.GetType(), targetType);
-            if (mapper != null) return mapper(value);
-
-            // Son çare: JSON üzerinden şekil eşlemesi (ör. worker'ın gerçek Point'i host'ta yüklüyse ama
-            // çağıran kendi PointDto'sunu istiyorsa).
-            var json = JsonSerializer.SerializeToUtf8Bytes(value, value.GetType(), JsonOptions);
-            return JsonSerializer.Deserialize(json, targetType, JsonOptions);
-        }
+        public static object? ConvertTo(object? value, Type targetType) =>
+            DSO.Core.Evoker.Conversion.EvokerValueConverter.ConvertTo(value, targetType); // kurallar çekirdekte (tek yer)
 
         private static WireValue Fixed(WireTypeCode code, byte[] raw) => new WireValue { TypeCode = code, Raw = raw };
 

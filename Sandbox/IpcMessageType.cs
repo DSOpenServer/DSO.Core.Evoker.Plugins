@@ -45,6 +45,17 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
         /// <summary>Aynı metoda TEK frame'de N çağrı (sırayla çalıştırılır). Cevap: InvokeBatchReply.</summary>
         InvokeBatch = 12,
-        InvokeBatchReply = 13
+        InvokeBatchReply = 13,
+
+        /// <summary>
+        /// Protokol v2: host → worker, pipe bağlantısından HEMEN sonra ve plugin yüklenmeden önce. Payload: plugin
+        /// constructor argümanları (JSON metni; boş = argümansız). Worker bunu okuyup plugin'i oluşturur, sonra Hello gönderir.
+        /// </summary>
+        Init = 14,
+
+        /// <summary>Protokol v2: JSON komut (DSO.Core.Evoker.Commands.EvokerCommand) - worker içinde EvokerTarget ile çalışır.</summary>
+        Command = 15,
+        /// <summary>Command'ın cevabı: EvokerCommandResult JSON'u.</summary>
+        CommandReply = 16
     }
 }

@@ -19,7 +19,7 @@ namespace DSO.Core.Evoker.Plugins.Management
     public sealed class SwitchablePluginBuilder : IPluginBuilder
     {
         private readonly PluginManager _manager;
-        private readonly string _id;
+        private readonly Guid _id;
         private readonly object _subsLock = new();
         private readonly List<ProxySubscription> _subs = new();
         private int? _defaultTimeoutMs;
@@ -29,7 +29,7 @@ namespace DSO.Core.Evoker.Plugins.Management
         // manager üzerinden gidilir (o da "kayıtlı değil" hatası verir - eski davranış).
         private readonly PluginManager.Slot _slot;
 
-        internal SwitchablePluginBuilder(PluginManager manager, PluginManager.Slot slot, string id, int? defaultTimeoutMs)
+        internal SwitchablePluginBuilder(PluginManager manager, PluginManager.Slot slot, Guid id, int? defaultTimeoutMs)
         {
             _manager = manager;
             _slot = slot;
@@ -37,10 +37,11 @@ namespace DSO.Core.Evoker.Plugins.Management
             _defaultTimeoutMs = defaultTimeoutMs;
         }
 
-        public string Id => _id;
-        public string TypeFullName => _manager.GetRegistrationCopy(_id).TypeFullName;
-        public bool IncludeNonPublic => _manager.GetRegistrationCopy(_id).IncludeNonPublic;
-        public bool IsSandboxed => _manager.GetRegistrationCopy(_id).Mode == PluginExecutionMode.Sandbox;
+        /// <summary>Plugin kaydının anahtarı.</summary>
+        public Guid Key => _id;
+        public string TypeFullName => _slot.Registration.TypeFullName;
+        public bool IncludeNonPublic => _slot.Registration.IncludeNonPublic;
+        public bool IsSandboxed => _slot.Registration.Mode == PluginExecutionMode.Sandbox;
 
         public int? DefaultTimeoutMs
         {
@@ -285,6 +286,10 @@ namespace DSO.Core.Evoker.Plugins.Management
         {
             lock (_subsLock) _subs.Remove(s);
         }
+
+        // --- JSON komut ---
+        public Task<DSO.Core.Evoker.Commands.EvokerCommandResult> ExecuteCommandAsync(DSO.Core.Evoker.Commands.EvokerCommand command,
+            CancellationToken cancellationToken = default) => RunFast(b => b.ExecuteCommandAsync(command, cancellationToken));
 
         // --- Tanım ---
         public Task<Scanning.PluginDescriptor> DescribeAsync(bool includeValues = true) => Run(b => b.DescribeAsync(includeValues));

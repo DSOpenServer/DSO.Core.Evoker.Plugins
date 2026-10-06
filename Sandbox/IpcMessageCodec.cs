@@ -125,6 +125,16 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             foreach (var a in args) WriteWireValue(bw, a);
         }
 
+        // --- Init (v2): [ConstructorArgsJson string] (boş = argümansız) ---
+        internal static void WriteInit(BinaryWriter bw, string? constructorArgsJson) => bw.Write(constructorArgsJson ?? "");
+
+        // --- Command / CommandReply (v2): [CorrelationId long][Json string] ---
+        internal static void WriteJsonMessage(BinaryWriter bw, long correlationId, string json)
+        {
+            bw.Write(correlationId);
+            bw.Write(json ?? "");
+        }
+
         // --- WireValue: [TypeCode byte][RawLen int][Raw bytes] ---
         private static void WriteWireValue(BinaryWriter bw, WireValue value)
         {
@@ -178,6 +188,20 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         }
 
         public static string DecodeFault(byte[] payload) => new SpanReader(payload).ReadString();
+
+        /// <summary>Init: constructor argümanları JSON'u (boş metin = argümansız → null).</summary>
+        public static string? DecodeInit(byte[] payload)
+        {
+            var s = new SpanReader(payload).ReadString();
+            return string.IsNullOrWhiteSpace(s) ? null : s;
+        }
+
+        public static (long CorrelationId, string Json) DecodeJsonMessage(byte[] payload)
+        {
+            var r = new SpanReader(payload);
+            long cid = r.ReadInt64();
+            return (cid, r.ReadString());
+        }
 
         public static ResolveRequest DecodeResolveRequest(byte[] payload)
         {

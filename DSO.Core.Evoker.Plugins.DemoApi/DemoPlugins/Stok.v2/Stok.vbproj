@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Örnek plugin: Stok (VB.NET) - sürüm 2. v1 ve v2 AYNI assembly adıyla (Stok.dll) DemoApi'nin bin klasöründe Plugins\Stok\v2\ altına kopyalanır. İkisi aynı anda (ayrı kayıtlar olarak) çalışabilir; bir kayıt PATCH ile v1'den v2'ye geçirilebilir.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>Stok</AssemblyName>
+    <RootNamespace></RootNamespace>
+    <OptionStrict>On</OptionStrict>
+    <OptionInfer>On</OptionInfer>
+    <Version>2.0.0</Version>
+  </PropertyGroup>
+
+</Project>

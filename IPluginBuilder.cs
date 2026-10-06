@@ -114,6 +114,15 @@ namespace DSO.Core.Evoker.Plugins
         /// </summary>
         Task<Scanning.PluginDescriptor> DescribeAsync(bool includeValues = true);
 
+        // --- JSON komut ---
+        /// <summary>
+        /// JSON komutu (DSO.Core.Evoker.Commands.EvokerCommand: invoke/get/set/batch/steps, sıralı ya da isimli argümanlar)
+        /// plugin instance'ı üzerinde çalıştırır. Sandbox'ta komut worker'ın İÇİNDE, plugin'in gerçek tipleriyle çalışır -
+        /// sonuç in-process ile birebir aynıdır (sandbox'ta Result alanları JsonElement olarak gelir; JSON'u aynıdır).
+        /// Hata fırlatmaz: hatalar sonuçta (Success=false, Error.Code) döner. Result.Mode = "InProcess" / "Sandbox".
+        /// </summary>
+        Task<DSO.Core.Evoker.Commands.EvokerCommandResult> ExecuteCommandAsync(DSO.Core.Evoker.Commands.EvokerCommand command, System.Threading.CancellationToken cancellationToken = default);
+
         // --- Cache ---
         /// <summary>Plugin tipinin DynamicEntityAccessor cache'ini temizler (sandbox'ta worker içinde).</summary>
         void ForgetCache();

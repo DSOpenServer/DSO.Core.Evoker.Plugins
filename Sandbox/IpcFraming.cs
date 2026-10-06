@@ -152,6 +152,16 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             WriteEncodedAsync(IpcMessageType.EventRaised, (subscriptionId, args),
                 static (bw, s) => IpcMessageCodec.WriteEventRaised(bw, s.subscriptionId, s.args), ct);
 
+        /// <summary>v2: bağlantıdan hemen sonra host → worker (constructor argümanları JSON'u; null = argümansız).</summary>
+        public Task WriteInitAsync(string? constructorArgsJson, CancellationToken ct = default) =>
+            WriteEncodedAsync(IpcMessageType.Init, constructorArgsJson, static (bw, j) => IpcMessageCodec.WriteInit(bw, j), ct);
+
+        public Task WriteCommandAsync(long correlationId, string commandJson, CancellationToken ct = default) =>
+            WriteEncodedAsync(IpcMessageType.Command, (correlationId, commandJson), static (bw, x) => IpcMessageCodec.WriteJsonMessage(bw, x.correlationId, x.commandJson), ct);
+
+        public Task WriteCommandReplyAsync(long correlationId, string resultJson, CancellationToken ct = default) =>
+            WriteEncodedAsync(IpcMessageType.CommandReply, (correlationId, resultJson), static (bw, x) => IpcMessageCodec.WriteJsonMessage(bw, x.correlationId, x.resultJson), ct);
+
         public Task WritePingAsync(CancellationToken ct = default) =>
             WriteFrameAsync(IpcMessageType.Ping, ReadOnlyMemory<byte>.Empty, ct);
 

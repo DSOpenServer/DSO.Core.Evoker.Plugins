@@ -49,11 +49,23 @@ var writer = new IpcWriter(pipe);
 var reader = new IpcReader(pipe);
 
 // TODO 22 adım 3: plugin'i yükle, Hello ile sonucu bildir.
+// Protokol v2: host bağlantıdan hemen sonra Init gönderir (constructor argümanları JSON'u) - plugin ondan sonra oluşturulur.
 ManagedDotNetPluginLoader loader;
 try
 {
+    var (initType, initPayload) = await reader.ReadFrameAsync().ConfigureAwait(false);
+    if (initType != IpcMessageType.Init)
+        throw new InvalidOperationException($"Beklenen ilk mesaj Init (protokol v{IpcProtocol.Version}), gelen: {initType} - host ile worker sürümleri uyumsuz.");
+    string? ctorJson = IpcMessageCodec.DecodeInit(initPayload);
+    System.Text.Json.JsonElement? ctorArgs = null;
+    if (ctorJson != null)
+    {
+        using var ctorDoc = System.Text.Json.JsonDocument.Parse(ctorJson);
+        ctorArgs = ctorDoc.RootElement.Clone();
+    }
+
     loader = new ManagedDotNetPluginLoader();
-    await loader.LoadInProcessAsync(pluginFilePath, typeFullName, includeNonPublic).ConfigureAwait(false);
+    await loader.LoadInProcessAsync(pluginFilePath, typeFullName, includeNonPublic, ctorArgs).ConfigureAwait(false);
     await writer.WriteHelloAsync(success: true, typeFullName: loader.Builder!.Type.FullName, error: null, protocolVersion: IpcProtocol.Version).ConfigureAwait(false);
 }
 catch (Exception ex)
@@ -67,6 +79,8 @@ catch (Exception ex)
 var handleTable = new System.Collections.Concurrent.ConcurrentDictionary<int, (string MethodName, MethodInfo Representative, Type[] ParamTypes)>();
 int handleCounter = 0;
 var concurrencyGate = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+// JSON komutlar için hedef: yüklenen plugin nesnesi (Singleton - plugin'in kendi state'i korunur).
+var commandTarget = DSO.Core.Evoker.Commands.EvokerTarget.ForInstance(loader.Instance!, includeNonPublic);
 // Event abonelikleri: host'un verdiği abonelik id'si -> worker'daki gerçek abonelik (Dispose = çık).
 var eventSubscriptions = new System.Collections.Concurrent.ConcurrentDictionary<int, IDisposable>();
 // Plugin event'leri plugin'in KENDİ thread'lerinden (ör. arka arkaya ilerleme bildirimleri) gelir; sıralarının
@@ -120,6 +134,11 @@ while (true)
 
         case IpcMessageType.InvokeBatch:
             _ = HandleInvokeBatchAsync(IpcMessageCodec.DecodeInvokeBatchRequest(payload));
+            break;
+
+        case IpcMessageType.Command:
+            // JSON komut: in-process ile AYNI çalıştırıcı (EvokerTarget) - aynı concurrency gate'ten geçer.
+            _ = HandleCommandAsync(IpcMessageCodec.DecodeJsonMessage(payload));
             break;
 
         case IpcMessageType.Member:
@@ -407,6 +426,42 @@ async Task HandleMemberAsync(MemberRequest request)
 // IpcWriter kendi içinde write-lock'lu olduğu için Ping-cevabı/Resolve-cevabı/Invoke-cevabı
 // yollarının hepsi AYNI ANDA çağrılsa bile pipe'a yazımlar birbirine karışmaz - burada sadece
 // (host zaten öldüyse) bir yazma hatasının tüm worker'ı çökertmesini engelliyoruz.
+async Task HandleCommandAsync((long CorrelationId, string Json) request)
+{
+    await concurrencyGate.WaitAsync().ConfigureAwait(false);
+    string resultJson;
+    try
+    {
+        DSO.Core.Evoker.Commands.EvokerCommandResult result;
+        try
+        {
+            var command = DSO.Core.Evoker.Commands.EvokerCommand.Parse(request.Json);
+            result = await commandTarget.ExecuteAsync(command).ConfigureAwait(false);
+        }
+        catch (DSO.Core.Evoker.Commands.EvokerCommandException ex)
+        {
+            result = DSO.Core.Evoker.Commands.EvokerCommandResult.Fail(ex.Code, ex.Message);
+        }
+        result.Mode = "Sandbox";
+        try { resultJson = result.ToJson(); }
+        catch (Exception ex)
+        {
+            // Sonuç JSON'a çevrilemiyor (ör. döngüsel olmayan ama serileştirilemeyen bir tip) - açık hata dön.
+            resultJson = DSO.Core.Evoker.Commands.EvokerCommandResult.Fail(DSO.Core.Evoker.Commands.EvokerErrorCodes.InternalError,
+                $"Sonuç JSON'a çevrilemedi: {ex.Message}", ex.GetType().FullName).ToJson();
+        }
+    }
+    catch (Exception ex)
+    {
+        resultJson = DSO.Core.Evoker.Commands.EvokerCommandResult.Fail(DSO.Core.Evoker.Commands.EvokerErrorCodes.InternalError, ex.Message, ex.GetType().FullName).ToJson();
+    }
+    finally
+    {
+        concurrencyGate.Release();
+    }
+    await SafeWriteAsync(() => writer.WriteCommandReplyAsync(request.CorrelationId, resultJson)).ConfigureAwait(false);
+}
+
 async Task SafeWriteAsync(Func<Task> write)
 {
     try { await write().ConfigureAwait(false); }

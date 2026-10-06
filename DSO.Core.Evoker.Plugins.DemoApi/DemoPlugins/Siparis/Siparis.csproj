@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Örnek plugin: Siparis (C#). Evoker'a hiçbir referansı YOK - sıradan bir sınıf kütüphanesi.
+    DemoApi derlenince bu proje de derlenir ve çıktısı DemoApi'nin bin klasöründe Plugins\Siparis\1.0\ altına kopyalanır.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Siparis</AssemblyName>
+    <RootNamespace>Siparis</RootNamespace>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+</Project>

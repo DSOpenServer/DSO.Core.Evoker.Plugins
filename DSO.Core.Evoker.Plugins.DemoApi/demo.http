@@ -1,0 +1,268 @@
+### DSO Evoker Demo API - örnek istekler
+### Visual Studio 2022 (.http) ya da VS Code "REST Client" eklentisiyle "Send Request".
+### Anahtar zinciri ({{kayit.response...}}) REST Client'ta kendiliğinden çalışır; Visual Studio'da
+### kayıt cevabındaki "key" değerini aşağıdaki @siparis / @stok / @rapor değişkenlerine yapıştırın.
+
+@host = http://localhost:5080
+@siparis = {{siparisKayit.response.body.$.result.key}}
+@stok = {{stokKayit.response.body.$.result.key}}
+@rapor = {{raporKayit.response.body.$.result.key}}
+
+### ================= 1. Plugins klasörü =================
+
+### Sistem bilgisi (kök klasör, worker, sayılar)
+GET {{host}}/api/plugins/system
+
+### Plugins klasöründeki DLL'ler (alt klasörler dahil)
+GET {{host}}/api/plugin-files
+
+### DLL'i ÇALIŞTIRMADAN tara: tipler, public yüzey özeti, kayıt şablonu (registerTemplate)
+GET {{host}}/api/plugin-files/scan?path=Siparis/1.0/Siparis.dll
+
+### Bir tipin tam tanımı + her üye için hazır komut şablonu
+GET {{host}}/api/plugin-files/scan?path=Siparis/1.0/Siparis.dll&type=Siparis.SiparisServisi&samples=true
+
+### ================= 2. Kayıt =================
+
+### Siparis'i kaydet (pasif - "aktif et" denince yüklenir)
+# @name siparisKayit
+POST {{host}}/api/plugins
+Content-Type: application/json
+
+{
+  "path": "Siparis/1.0/Siparis.dll",
+  "typeName": "Siparis.SiparisServisi",
+  "name": "Merkez mağaza siparişleri",
+  "mode": "Sandbox",
+  "isActive": false,
+  "constructorArgs": { "magazaAdi": "Merkez", "kdvOrani": 0.20, "ayarlar": { "maxSatir": 10, "onayGecikmesiMs": 100 } },
+  "notes": "demo"
+}
+
+### Liste (pasifken de özet + ayarlar)
+GET {{host}}/api/plugins
+
+### Detay + komut şablonları (pasifken de çalışır)
+GET {{host}}/api/plugins/{{siparis}}?samples=true
+
+### Aktif et (= yükle)
+POST {{host}}/api/plugins/{{siparis}}/activate
+
+### ================= 3. Komutlar =================
+
+### Sipariş oluştur - iç içe nesneler, isimli argümanlar
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{
+  "op": "invoke",
+  "member": "Olustur",
+  "args": {
+    "musteri": { "kod": "C001", "ad": "Ayşe Yılmaz", "adres": { "il": "İzmir", "ilce": "Bornova" } },
+    "satirlar": [
+      { "urunKodu": "KLM-001", "adet": 2, "birimFiyat": 100 },
+      { "urunKodu": "DFT-010", "adet": 1, "birimFiyat": 50 }
+    ]
+  }
+}
+
+### Overload: sıralı argümanlarla kısa Olustur(musteriKodu, urunKodu, adet, birimFiyat)
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Olustur", "args": ["C002", "KLM-002", 3, 10] }
+
+### Çok adımlı: onayla (async) -> kargoya ver (async) -> durum oku
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{
+  "steps": [
+    { "op": "invoke", "member": "OnaylaAsync", "args": [1001] },
+    { "op": "invoke", "member": "KargoyaVerAsync", "args": { "no": 1001, "kargoFirmasi": "Aras" } },
+    { "op": "get", "member": "SonIslem" },
+    { "op": "invoke", "member": "Getir", "args": [1001] }
+  ],
+  "stopOnError": true
+}
+
+### Paralel görevler (Task.WhenAll): 3 tedarikçiden fiyat
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "FiyatTeklifiAlAsync", "args": { "urunKodlari": ["KLM-001", "KLM-002", "DFT-010"] } }
+
+### 100 siparişi aynı anda oluştur
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "TopluOlusturAsync", "args": { "adet": 100 } }
+
+### Property yaz + oku
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{ "steps": [ { "op": "set", "member": "KdvOrani", "value": 0.10 }, { "op": "get", "member": "KdvOrani" }, { "op": "get", "member": "ToplamCiro" } ] }
+
+### Plugin içi hata -> 500 TargetException (exceptionType ile)
+POST {{host}}/api/plugins/{{siparis}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Getir", "args": [99999] }
+
+### Detay + o anki değerler (plugin çalışırken)
+GET {{host}}/api/plugins/{{siparis}}?values=true
+
+### ================= 4. Canlı mod değişimi =================
+
+### Sandbox -> InProcess (önce yeni kopya yüklenir, sonra worker kapanır; state sıfırlanır)
+PUT {{host}}/api/plugins/{{siparis}}/mode
+Content-Type: application/json
+
+{ "mode": "InProcess" }
+
+### ================= 5. Stok (VB.NET) v1 / v2 =================
+
+### Stok v1 - constructor'ın tüm parametreleri Optional: constructorArgs gerekmez; typeName verilmezse servis tipi seçilir
+# @name stokKayit
+POST {{host}}/api/plugins
+Content-Type: application/json
+
+{ "path": "Stok/v1/Stok.dll", "name": "Ana depo stok", "mode": "InProcess", "isActive": true }
+
+### VB: büyük/küçük harf duyarsız, Optional atlanır
+POST {{host}}/api/plugins/{{stok}}/execute
+Content-Type: application/json
+
+{
+  "steps": [
+    { "op": "invoke", "member": "giris", "args": { "urunKodu": "klm-001", "adet": 5 } },
+    { "op": "invoke", "member": "MIKTAR", "args": ["KLM-001"] },
+    { "op": "invoke", "member": "Liste" }
+  ]
+}
+
+### v1 -> v2 (aynı kayıt, yeni sürüm; yeniden yüklenir)
+PATCH {{host}}/api/plugins/{{stok}}
+Content-Type: application/json
+
+{ "path": "Stok/v2/Stok.dll", "constructorArgs": { "kritikSeviye": 50 }, "notes": "v2'ye geçti" }
+
+### v2: async sayım (depolar paralel) + ParamArray
+POST {{host}}/api/plugins/{{stok}}/execute
+Content-Type: application/json
+
+{
+  "steps": [
+    { "op": "invoke", "member": "SayimAsync" },
+    { "op": "invoke", "member": "ToplamMiktar", "args": ["KLM-001", "KLM-002"] },
+    { "op": "get", "member": "Surum" }
+  ]
+}
+
+### ================= 6. Rapor - izolasyon, timeout, çökme =================
+
+# @name raporKayit
+POST {{host}}/api/plugins
+Content-Type: application/json
+
+{ "path": "Rapor/1.0/Rapor.dll", "typeName": "Rapor.RaporServisi", "name": "Raporlar", "mode": "Sandbox", "isActive": true }
+
+### Hangi process'te çalışıyor? (sandbox: ayrı pid)
+POST {{host}}/api/plugins/{{rapor}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Ortam" }
+
+### Timeout: 5 sn süren iş, 500 ms bekleme sınırı -> 504
+POST {{host}}/api/plugins/{{rapor}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "YavasAsync", "args": [5000], "timeoutMs": 500 }
+
+### İç içe istek nesnesi, enum metin, tarih metin
+POST {{host}}/api/plugins/{{rapor}}/execute
+Content-Type: application/json
+
+{
+  "op": "invoke",
+  "member": "OlusturAsync",
+  "args": { "istek": { "baslik": "Haftalık", "baslangic": "2026-09-01", "bitis": "2026-09-07", "kaynaklar": ["satis", "iade", "stok"], "bicim": "Csv" } }
+}
+
+### Worker'ı çökert: host ayakta kalır, durum Crashed olur, sonraki çağrı yeni worker açar
+POST {{host}}/api/plugins/{{rapor}}/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Cokert" }
+
+### Çökmeden sonra durum
+GET {{host}}/api/plugins/{{rapor}}
+
+### ================= 7. Yaşam döngüsü =================
+
+### Bellekten at ama aktif bırak (ilk çağrıda yeniden yüklenir)
+POST {{host}}/api/plugins/{{stok}}/stop
+
+### Yeniden yükle (DLL değiştiyse)
+POST {{host}}/api/plugins/{{stok}}/reload
+
+### Pasif yap (bellekten atılır, listede kalır)
+POST {{host}}/api/plugins/{{siparis}}/deactivate
+
+### Filtreli liste
+GET {{host}}/api/plugins?active=true&state=Running
+
+### Ad / not değiştir (yeniden başlatmaz)
+PATCH {{host}}/api/plugins/{{rapor}}
+Content-Type: application/json
+
+{ "name": "Rapor servisi", "notes": "güncellendi" }
+
+### Sil
+DELETE {{host}}/api/plugins/{{rapor}}
+
+### ================= 8. Plugin olmayan hedefler (EvokerCatalog) =================
+
+### Tüm hedefler (plugin'ler dahil, Kind=Plugin)
+GET {{host}}/api/evoker/targets
+
+### Singleton sayaç
+POST {{host}}/api/evoker/targets/5a1ac000-0000-4000-8000-000000000001/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Arttir", "args": [5] }
+
+### Scoped sepet: adımlar aynı nesneyi paylaşır
+POST {{host}}/api/evoker/targets/5a1ac000-0000-4000-8000-000000000002/execute
+Content-Type: application/json
+
+{
+  "steps": [
+    { "op": "invoke", "member": "Ekle", "args": { "urun": "Kalem", "adet": 2, "fiyat": 7.5 } },
+    { "op": "invoke", "member": "Ekle", "args": { "urun": "Defter", "fiyat": 20 } },
+    { "op": "invoke", "member": "Toplam" },
+    { "op": "invoke", "member": "Kalemler" }
+  ]
+}
+
+### Transient hesap makinesi: params double[]
+POST {{host}}/api/evoker/targets/5a1ac000-0000-4000-8000-000000000003/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Ortalama", "args": [1, 2, 6] }
+
+### Static sınıf
+POST {{host}}/api/evoker/targets/5a1ac000-0000-4000-8000-000000000004/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Bicimle", "args": { "tarih": "2026-10-05T15:47:00" } }
+
+### Hedef tanımı + şablonlar
+GET {{host}}/api/evoker/targets/5a1ac000-0000-4000-8000-000000000002?samples=true
+
+### İsimle erişim (izin listesi - appsettings Evoker:AllowTypesFrom; boşsa 403)
+POST {{host}}/api/evoker/types/System.Math/execute
+Content-Type: application/json
+
+{ "op": "invoke", "member": "Max", "args": [3, 7] }

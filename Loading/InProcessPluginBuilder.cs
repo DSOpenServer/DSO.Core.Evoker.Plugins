@@ -290,6 +290,21 @@ namespace DSO.Core.Evoker.Plugins.Loading
         private Func<object?[], T?> PerCall<T>(string methodName) => args => Invoke<T>(methodName, args);
         private Action<object?[]> PerCallAction(string methodName) => args => Execute(methodName, args);
 
+        // --- JSON komut (çekirdekteki EvokerTarget - worker'da da aynısı çalışır) ---
+
+        private DSO.Core.Evoker.Commands.EvokerTarget? _commandTarget;
+
+        public async Task<DSO.Core.Evoker.Commands.EvokerCommandResult> ExecuteCommandAsync(DSO.Core.Evoker.Commands.EvokerCommand command,
+            System.Threading.CancellationToken cancellationToken = default)
+        {
+            if (command == null) throw new ArgumentNullException(nameof(command));
+            var target = _commandTarget ??= DSO.Core.Evoker.Commands.EvokerTarget.ForInstance(Builder.Instance!, IncludeNonPublic);
+            target.DefaultTimeoutMs = DefaultTimeoutMs;
+            var result = await target.ExecuteAsync(command, cancellationToken).ConfigureAwait(false);
+            result.Mode = "InProcess";
+            return result;
+        }
+
         // --- Event'ler ---
 
         public IDisposable Subscribe(string eventName, Action<PluginEventArgs> handler)

@@ -131,4 +131,32 @@ namespace TestPlugin
         public int X { get; set; }
         public int Y { get; set; }
     }
+
+    /// <summary>
+    /// Parametresiz constructor'ı OLMAYAN plugin - kayıttaki ConstructorArgs ile oluşturulur (in-process ve sandbox).
+    /// </summary>
+    public class ConfiguredPlugin
+    {
+        private readonly string _conn;
+        private readonly int _limit;
+        private readonly Level _level;
+        private int _calls;
+
+        public ConfiguredPlugin(string conn, int limit = 5, Level level = Level.Mid)
+        {
+            if (conn == "patla") throw new InvalidOperationException("constructor kasıtlı hata");
+            _conn = conn;
+            _limit = limit;
+            _level = level;
+        }
+
+        public string Info() => $"{_conn}|{_limit}|{_level}";
+        public int Call() => ++_calls;
+        public async System.Threading.Tasks.Task<int> SumAsync(System.Collections.Generic.List<int> items)
+        {
+            await System.Threading.Tasks.Task.Delay(1);
+            return System.Linq.Enumerable.Sum(items);
+        }
+        public Point Move(Point p, int dx) => new Point { X = p.X + dx, Y = p.Y };
+    }
 }

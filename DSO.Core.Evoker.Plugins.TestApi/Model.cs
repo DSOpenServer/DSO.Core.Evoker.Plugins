@@ -1,4 +1,6 @@
 ﻿using DSO.Core.Evoker;
+using DSO.Core.Evoker.Commands;
+using DSO.Core.Evoker.Description;
 using DSO.Core.Evoker.Plugins;
 using DSO.Core.Evoker.Plugins.Loading;
 using DSO.Core.Evoker.Plugins.Management;
@@ -1305,6 +1307,19 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 Same("büyük/küçük harf farklı ad (JSON eşlemez)", new MapSrcA { X = 1, Y = 2 }, typeof(MapDstLower));
             }
 
+            // 5c) Şablonlar DLL ÇALIŞTIRILMADAN da üretilir (MetadataLoadContext tipleriyle - çekirdekteki EvokerSampleBuilder)
+            Console.WriteLine("\n===== ŞABLON: DLL çalıştırılmadan (MetadataLoadContext) =====");
+            {
+                var sd = PluginInspector.Describe(dllPath, TypeName, new PluginDescribeOptions { IncludeSamples = true });
+                var sum = sd.Type.Methods!.First(m => m.Name == "SumPoint");
+                Check("SumPoint şablonu: plugin'in Point tipinin iskeleti", sum.Sample?.GetRawText() == "{\"op\":\"invoke\",\"member\":\"SumPoint\",\"args\":{\"p\":{\"X\":0,\"Y\":0}}}", sum.Sample?.GetRawText() ?? "");
+                var opt = sd.Type.Methods!.First(m => m.Name == "OptionalDemo");
+                Check("OptionalDemo şablonu: optional varsayılanları", opt.Sample?.GetRawText() == "{\"op\":\"invoke\",\"member\":\"OptionalDemo\",\"args\":{\"a\":0,\"b\":5,\"s\":\"x\"}}", opt.Sample?.GetRawText() ?? "");
+                Check("imza metni", opt.Signature == "string OptionalDemo(int a, int b = 5, string s = \"x\")", opt.Signature ?? "");
+                var loc = sd.Type.Properties!.First(p => p.Name == "Location");
+                Check("property set şablonu", loc.SampleSet?.GetRawText() == "{\"op\":\"set\",\"member\":\"Location\",\"value\":{\"X\":0,\"Y\":0}}", loc.SampleSet?.GetRawText() ?? "");
+            }
+
             // 6) Promote: IPluginBuilder'a yazılmış kod sandbox -> in-process geçişinde DEĞİŞMEDEN çalışmalı
             Console.WriteLine("\n===== PROMOTE: aynı kod, sandbox'tan in-process'e =====");
             static int BusinessLogic(IPluginBuilder b) => b.Invoke<int>("Add", 20, 22) + b.GetValue<int>("ReadOnlyValue");
@@ -1389,54 +1404,58 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             string configPath = Path.Combine(Path.GetTempPath(), "dso-plugins-" + Guid.NewGuid().ToString("N")[..6] + ".json");
             var managerOptions = new PluginManagerOptions { HostPath = hostDllPath, NotifyOnCrash = false };
 
-            Console.WriteLine("=== 1) Kayıt, doğrulama, kalıcılık ===");
+            Console.WriteLine("=== 1) Kayıt, doğrulama, kalıcılık (Guid anahtar, isim sadece açıklama) ===");
             var mgr = new PluginManager(new JsonFilePluginConfigStore(configPath), managerOptions);
             await mgr.InitializeAsync();
-            var r1 = await mgr.RegisterAsync(new PluginRegistration { Id = "sample", FilePath = dllPath, TypeFullName = TypeName, MaxConcurrency = 2 });
-            Check("kayıt başarılı", r1.Success && r1.Id == "sample", r1.Message);
-            Check("kayıt JSON dosyasına yazıldı", File.Exists(configPath) && File.ReadAllText(configPath).Contains("\"Mode\": \"Sandbox\""));
-            var badType = await mgr.RegisterAsync(new PluginRegistration { Id = "x", FilePath = dllPath, TypeFullName = "Yok.BoyleBirTip" });
-            Check("olmayan tip: exception YOK, mesaj var, eklenmedi", !badType.Success && !mgr.Registrations.Any(r => r.Id == "x"), badType.Message);
-            var badFile = await mgr.RegisterAsync(new PluginRegistration { Id = "y", FilePath = "/yok/x.dll", TypeFullName = TypeName });
-            Check("olmayan dosya: exception YOK, mesaj var, eklenmedi", !badFile.Success && !mgr.Registrations.Any(r => r.Id == "y"), badFile.Message);
-            var dup = await mgr.RegisterAsync(new PluginRegistration { Id = "SAMPLE", FilePath = dllPath, TypeFullName = TypeName });
-            Check("aynı ad (büyük/küçük harf farklı) ikinci kez: exception YOK, mesaj var, eklenmedi",
-                !dup.Success && mgr.Registrations.Count(r => r.Id.Equals("sample", StringComparison.OrdinalIgnoreCase)) == 1, dup.Message);
+            var r1 = await mgr.RegisterAsync(new PluginRegistration { Name = "Örnek", FilePath = dllPath, TypeFullName = TypeName, MaxConcurrency = 2, IsActive = false });
+            Guid sampleKey = r1.Key ?? Guid.Empty;
+            Check("kayıt başarılı, Guid anahtar üretildi", r1.Success && sampleKey != Guid.Empty && r1.State == PluginState.Inactive, r1.Message);
+            Check("kayıt JSON dosyasına yazıldı (Key + Mode)", File.Exists(configPath) && File.ReadAllText(configPath).Contains(sampleKey.ToString()) && File.ReadAllText(configPath).Contains("\"Mode\": \"Sandbox\""));
+            Check("AssemblyVersion DLL'den otomatik okundu", mgr.GetRegistrationCopy(sampleKey).AssemblyVersion != null, mgr.GetRegistrationCopy(sampleKey).AssemblyVersion ?? "");
+            var badType = await mgr.RegisterAsync(new PluginRegistration { FilePath = dllPath, TypeFullName = "Yok.BoyleBirTip" });
+            Check("olmayan tip: exception YOK, mesaj var, eklenmedi", !badType.Success && mgr.Registrations.Count == 1, badType.Message);
+            var badFile = await mgr.RegisterAsync(new PluginRegistration { FilePath = "/yok/x.dll", TypeFullName = TypeName });
+            Check("olmayan dosya: exception YOK, mesaj var, eklenmedi", !badFile.Success && mgr.Registrations.Count == 1, badFile.Message);
+            var sameName = await mgr.RegisterAsync(new PluginRegistration { Name = "Örnek", FilePath = dllPath, TypeFullName = TypeName, IsActive = false });
+            Check("aynı isim tekrar: serbest (isim sadece açıklama), farklı Guid", sameName.Success && sameName.Key != sampleKey && mgr.Registrations.Count == 2, sameName.Message);
+            await mgr.UnregisterAsync(sameName.Key!.Value);
 
             Console.WriteLine("\n=== 1b) Aynı plugin'in birden çok örneği (isimli + isimsiz) ===");
-            var named = await mgr.RegisterAsync(new PluginRegistration { Id = "sample-sirketB", FilePath = dllPath, TypeFullName = TypeName, Mode = PluginExecutionMode.InProcess });
+            var named = await mgr.RegisterAsync(new PluginRegistration { Name = "sample-sirketB", FilePath = dllPath, TypeFullName = TypeName, Mode = PluginExecutionMode.InProcess });
             var unnamed = await mgr.RegisterAsync(new PluginRegistration { FilePath = dllPath, TypeFullName = TypeName });
-            Check("isimli ikinci örnek eklendi", named.Success, named.Message);
-            Check("isimsiz örnek: GUID üretildi", unnamed.Success && Guid.TryParse(unnamed.Id, out _), $"{unnamed.Id} - {unnamed.Message}");
-            Check("GUID kalıcı: JSON'a yazıldı", File.ReadAllText(configPath).Contains(unnamed.Id!));
-            Check("DisplayName tip + ad içeriyor", mgr.GetRegistrationCopy(named.Id!).DisplayName == $"{TypeName} [sample-sirketB]");
-            var instA = mgr.Get(named.Id!);
-            var instB = mgr.Get(unnamed.Id!);
+            Check("isimli ikinci örnek eklendi ve hemen yüklendi (aktif = yüklü)", named.Success && named.State == PluginState.Running, named.Message);
+            Check("isimsiz örnek: isim boş, Guid anahtar", unnamed.Success && mgr.GetRegistrationCopy(unnamed.Key!.Value).Name == null, unnamed.Message);
+            Check("DisplayName: \"Ad (Tip)\" / isimsizse tip", mgr.GetRegistrationCopy(named.Key!.Value).DisplayName == $"sample-sirketB ({TypeName})" && mgr.GetRegistrationCopy(unnamed.Key!.Value).DisplayName == TypeName);
+            var instA = mgr.Get(named.Key!.Value);
+            var instB = mgr.Get(unnamed.Key!.Value);
             instA.SetValue("DisplayName", "B şirketi");
             instB.SetValue("DisplayName", "isimsiz");
             Check("örneklerin state'i ayrı", instA.GetValue<string>("DisplayName") == "B şirketi" && instB.GetValue<string>("DisplayName") == "isimsiz");
-            Check("biri in-process, diğeri sandbox çalışıyor", !instA.IsSandboxed && instB.IsSandboxed && mgr.GetStatus(unnamed.Id!).ProcessId != null);
-            var mgrDesc = await mgr.DescribeAsync(named.Id!);
+            Check("biri in-process, diğeri sandbox çalışıyor", !instA.IsSandboxed && instB.IsSandboxed && mgr.GetStatus(unnamed.Key!.Value).ProcessId != null);
+            var mgrDesc = await mgr.DescribeAsync(named.Key!.Value);
             Check("manager.DescribeAsync: çalışan örneğin değerleri dahil",
                 mgrDesc.Values != null && mgrDesc.Type.Properties!.First(p => p.Name == "DisplayName").Value?.GetString() == "B şirketi");
-            await mgr.StopAsync(named.Id!);
-            var stoppedDesc = await mgr.DescribeAsync(named.Id!);
-            Check("çalışmayan plugin: sadece yapı + uyarı (plugin başlatılmadı)",
-                stoppedDesc.Values == null && stoppedDesc.Warnings?.Count > 0 && !mgr.GetStatus(named.Id!).IsRunning);
+            await mgr.StopAsync(named.Key!.Value);
+            var stoppedDesc = await mgr.DescribeAsync(named.Key!.Value);
+            Check("durdurulmuş plugin: sadece yapı + uyarı (plugin başlatılmadı), durum Stopped",
+                stoppedDesc.Values == null && stoppedDesc.Warnings?.Count > 0 && mgr.GetStatus(named.Key!.Value).State == PluginState.Stopped);
             File.WriteAllText(Path.Combine(Path.GetTempPath(), "plugin-describe-manager.json"), mgrDesc.ToJson());
-            await mgr.UnregisterAsync(named.Id!);
-            await mgr.UnregisterAsync(unnamed.Id!);
+            await mgr.UnregisterAsync(named.Key!.Value);
+            await mgr.UnregisterAsync(unnamed.Key!.Value);
             Check("ek örnekler silindi", mgr.Registrations.Count == 1);
 
-            var scan = mgr.Scan("sample");
+            var scan = mgr.Scan(sampleKey);
             Check("Scan: property/field/event listesi", scan.Types.Any(t => t.Events.Count >= 3 && t.Properties.Count >= 3), $"{scan.Types[0].Methods.Count} metot, {scan.Types[0].Properties.Count} property, {scan.Types[0].Events.Count} event");
 
-            Console.WriteLine("\n=== 2) Uygulamanın elindeki builder - lazy başlatma (sandbox) ===");
-            IPluginBuilder app = mgr.Get("sample");
-            Check("Get her seferinde AYNI nesne", ReferenceEquals(app, mgr.Get("sample")));
-            Check("henüz başlatılmadı (lazy)", !mgr.GetStatus("sample").IsRunning);
+            Console.WriteLine("\n=== 2) Uygulamanın elindeki builder - pasif -> aktif (sandbox) ===");
+            IPluginBuilder app = mgr.Get(sampleKey);
+            Check("Get her seferinde AYNI nesne", ReferenceEquals(app, mgr.Get(sampleKey)));
+            Check("pasif: yüklü değil, çağrı reddedilir", !mgr.GetStatus(sampleKey).IsRunning && mgr.GetStatus(sampleKey).State == PluginState.Inactive);
+            await Expect<InvalidOperationException>("pasif plugin'e çağrı -> InvalidOperationException", () => app.InvokeAsync("Add", 1, 1));
+            var act = await mgr.ActivateAsync(sampleKey);
+            Check("ActivateAsync: hemen yüklendi (Running)", act.State == PluginState.Running && act.IsActive, act.State.ToString());
             Check("ilk çağrı: Add(2,3)=5", app.Invoke<int>("Add", 2, 3) == 5);
-            var st = mgr.GetStatus("sample");
+            var st = mgr.GetStatus(sampleKey);
             Check("şimdi sandbox'ta çalışıyor", st.IsRunning && st.Mode == PluginExecutionMode.Sandbox && st.ProcessId != null && app.IsSandboxed, $"pid={st.ProcessId}");
 
             var counterEvents = new System.Collections.Concurrent.ConcurrentQueue<int>();
@@ -1453,8 +1472,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Console.WriteLine("\n=== 3) Admin: Sandbox -> InProcess (canlı geçiş) ===");
             var modeChanges = new List<PluginExecutionMode>();
             mgr.ModeChanged += (_, m) => modeChanges.Add(m);
-            await mgr.SetModeAsync("sample", PluginExecutionMode.InProcess);
-            st = mgr.GetStatus("sample");
+            await mgr.SetModeAsync(sampleKey, PluginExecutionMode.InProcess);
+            st = mgr.GetStatus(sampleKey);
             Check("mod InProcess, çalışıyor, worker yok", st.Mode == PluginExecutionMode.InProcess && st.IsRunning && st.ProcessId == null && !app.IsSandboxed);
             Check("AYNI builder nesnesi çalışıyor: Add(20,22)=42", app.Invoke<int>("Add", 20, 22) == 42);
             Check("AYNI GetFunc delegate'i yeni tarafa geçti", add(new object?[] { 5, 5 }) == 10);
@@ -1467,8 +1486,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             Check("karar kalıcı: JSON'da InProcess", File.ReadAllText(configPath).Contains("\"Mode\": \"InProcess\""));
 
             Console.WriteLine("\n=== 4) Admin: InProcess -> Sandbox (kesintisiz, eski kopya bellekten atılır) ===");
-            await mgr.SetModeAsync("sample", PluginExecutionMode.Sandbox);
-            st = mgr.GetStatus("sample");
+            await mgr.SetModeAsync(sampleKey, PluginExecutionMode.Sandbox);
+            st = mgr.GetStatus(sampleKey);
             Check("mod Sandbox, worker var", st.Mode == PluginExecutionMode.Sandbox && st.ProcessId != null && app.IsSandboxed);
             Check("eski in-process kopya bellekten GERÇEKTEN boşaltıldı", st.LastUnloadReleasedMemory == true, st.LastUnloadReleasedMemory?.ToString() ?? "null");
             Check("builder çalışıyor", app.Invoke<int>("Add", 1, 2) == 3);
@@ -1495,42 +1514,48 @@ namespace DSO.Core.Evoker.Plugins.TestApi
                 }
             });
             await Task.Delay(300);
-            await mgr.SetModeAsync("sample", PluginExecutionMode.InProcess);
+            await mgr.SetModeAsync(sampleKey, PluginExecutionMode.InProcess);
             await Task.Delay(300);
-            await mgr.SetModeAsync("sample", PluginExecutionMode.Sandbox);
+            await mgr.SetModeAsync(sampleKey, PluginExecutionMode.Sandbox);
             await Task.Delay(300);
             cts.Cancel();
             await load;
             Check("iki canlı geçiş boyunca çağrılar kesintisiz (0 hata)", failedCalls == 0 && okCalls > 100, $"başarılı {okCalls}, hatalı {failedCalls}{(firstError != null ? " - ilk hata: " + firstError : "")}");
 
             Console.WriteLine("\n=== 6) Kalıcılık: yeni bir PluginManager aynı dosyadan kararları okur ===");
-            await mgr.UpdateAsync("sample", r => { r.MaxConcurrency = 4; r.Notes = "admin notu"; });
+            await mgr.UpdateAsync(sampleKey, r => { r.MaxConcurrency = 4; r.Notes = "admin notu"; });
             var mgr2 = new PluginManager(new JsonFilePluginConfigStore(configPath), managerOptions);
             await mgr2.InitializeAsync();
-            var reg2 = mgr2.GetRegistrationCopy("sample");
+            var reg2 = mgr2.GetRegistrationCopy(sampleKey);
             Check("mod, MaxConcurrency, not okundu", reg2.Mode == PluginExecutionMode.Sandbox && reg2.MaxConcurrency == 4 && reg2.Notes == "admin notu");
             Check("UpdateAsync sonrası (yeniden başlatıldı) builder çalışıyor", app.Invoke<int>("Add", 4, 4) == 8);
 
             Console.WriteLine("\n=== 7) Çökme bildirimi + kendini toparlama ===");
             PluginWorkerCrashedEventArgs? crash = null;
-            string? crashedId = null;
-            mgr.PluginCrashed += (id, e) => { crashedId = id; crash = e; };
+            Guid? crashedId = null;
+            int crashCount = 0;
+            mgr.PluginCrashed += (id, e) => { crashedId = id; crash = e; Interlocked.Increment(ref crashCount); };
             await Expect<Exception>("CrashHard çağrısı hata verdi (host ayakta)", () => app.ExecuteAsync("CrashHard"));
             await WaitUntil(() => crash != null);
-            Check("PluginCrashed tetiklendi", crash != null && crashedId == "sample", crash?.Reason.GetType().Name ?? "yok");
-            Check("durum ekranında son çökme görünüyor", mgr.GetStatus("sample").LastCrashUtc != null);
+            Check("PluginCrashed tetiklendi", crash != null && crashedId == sampleKey, crash?.Reason.GetType().Name ?? "yok");
+            Check("durum ekranında son çökme görünüyor", mgr.GetStatus(sampleKey).LastCrashUtc != null);
             Check("sonraki çağrıda taze worker ile devam: Add(5,5)=10", app.Invoke<int>("Add", 5, 5) == 10);
 
             Console.WriteLine("\n=== 8) Devre dışı bırakma, durdurma, kayıt silme ===");
-            await mgr.StopAsync("sample");
-            Check("StopAsync: çalışmıyor", !mgr.GetStatus("sample").IsRunning);
+            await Task.Delay(300);
+            int crashesBefore = Volatile.Read(ref crashCount);
+            await mgr.StopAsync(sampleKey);
+            Check("StopAsync: yüklü değil ama aktif (Stopped)", !mgr.GetStatus(sampleKey).IsRunning && mgr.GetStatus(sampleKey).State == PluginState.Stopped, $"{mgr.GetStatus(sampleKey).State} {mgr.GetStatus(sampleKey).LastError}");
             Check("durdurulmuşken çağrı -> yeniden başlar", app.Invoke<int>("Add", 1, 1) == 2);
-            await mgr.UpdateAsync("sample", r => r.Enabled = false);
-            await Expect<InvalidOperationException>("Enabled=false iken çağrı reddedilir", () => app.InvokeAsync("Add", 1, 1));
-            await mgr.UpdateAsync("sample", r => r.Enabled = true);
+            var deact = await mgr.DeactivateAsync(sampleKey);
+            Check("DeactivateAsync: Inactive, bellekte yok", deact.State == PluginState.Inactive && !deact.IsRunning);
+            await Expect<InvalidOperationException>("pasif iken çağrı reddedilir", () => app.InvokeAsync("Add", 1, 1));
+            await mgr.ActivateAsync(sampleKey);
             Check("tekrar etkin", app.Invoke<int>("Add", 2, 2) == 4);
-            await mgr.UnregisterAsync("sample");
-            Check("kayıt silindi, JSON'da yok", !mgr.Registrations.Any() && !File.ReadAllText(configPath).Contains("sample"));
+            await Task.Delay(500);
+            Check("bilerek durdurma / pasifleştirme çökme SAYILMAZ (PluginCrashed yok)", Volatile.Read(ref crashCount) == crashesBefore, $"{Volatile.Read(ref crashCount) - crashesBefore} sahte çökme olayı");
+            await mgr.UnregisterAsync(sampleKey);
+            Check("kayıt silindi, JSON'da yok", !mgr.Registrations.Any() && !File.ReadAllText(configPath).Contains(sampleKey.ToString()));
             await Expect<KeyNotFoundException>("kayıt silindikten sonra eski builder (async) -> KeyNotFoundException", () => app.InvokeAsync<int>("Add", 1, 1));
             await Expect<KeyNotFoundException>("kayıt silindikten sonra eski builder (senkron) -> KeyNotFoundException", () => Task.FromResult(app.Invoke<int>("Add", 1, 1)));
 
@@ -1552,26 +1577,110 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             await using (var warm = new PluginManager(new JsonFilePluginConfigStore(warmConfig), new PluginManagerOptions { HostPath = hostDllPath, NotifyOnCrash = false, WarmStart = true }))
             {
                 await warm.InitializeAsync();
-                var wr = await warm.RegisterAsync(new PluginRegistration { Id = "warm", FilePath = dllPath, TypeFullName = TypeName });
+                var wr = await warm.RegisterAsync(new PluginRegistration { Name = "warm", FilePath = dllPath, TypeFullName = TypeName });
+                Guid warmKey = wr.Key!.Value;
                 Check("kayıt", wr.Success, wr.Message);
-                await WaitUntil(() => warm.GetStatus("warm").IsRunning);
-                Check("hiç çağrı yapılmadan worker çalışıyor (arka planda başladı)", warm.GetStatus("warm").IsRunning && warm.GetStatus("warm").ProcessId != null);
+                await WaitUntil(() => warm.GetStatus(warmKey).IsRunning);
+                Check("hiç çağrı yapılmadan worker çalışıyor", warm.GetStatus(warmKey).IsRunning && warm.GetStatus(warmKey).ProcessId != null);
                 var sw1 = Stopwatch.StartNew();
-                int r = warm.Get("warm").Invoke<int>("Add", 1, 2);
+                int r = warm.Get(warmKey).Invoke<int>("Add", 1, 2);
                 Check("ilk çağrı başlatma beklemeden döndü", r == 3 && sw1.ElapsedMilliseconds < 250, $"{sw1.ElapsedMilliseconds} ms");
-                Check("WarmUpAsync (zaten çalışıyor) -> true", await warm.WarmUpAsync("warm"));
-                await warm.RegisterAsync(new PluginRegistration { Id = "kapali", FilePath = dllPath, TypeFullName = TypeName, Enabled = false });
+                Check("WarmUpAsync (zaten çalışıyor) -> true", await warm.WarmUpAsync(warmKey));
+                var kapali = await warm.RegisterAsync(new PluginRegistration { Name = "kapali", FilePath = dllPath, TypeFullName = TypeName, IsActive = false });
                 await Task.Delay(300);
-                Check("Enabled=false kayıt ısıtılmıyor", !warm.GetStatus("kapali").IsRunning && !await warm.WarmUpAsync("kapali"));
+                Check("pasif kayıt yüklenmiyor", !warm.GetStatus(kapali.Key!.Value).IsRunning && !await warm.WarmUpAsync(kapali.Key!.Value));
             }
             // Yeni bir manager AYNI dosyayla açılınca (uygulama yeniden başladı) etkin plugin'ler InitializeAsync'te ısınır.
             await using (var warm2 = new PluginManager(new JsonFilePluginConfigStore(warmConfig), new PluginManagerOptions { HostPath = hostDllPath, NotifyOnCrash = false, WarmStart = true }))
             {
                 await warm2.InitializeAsync();
-                await WaitUntil(() => warm2.GetStatus("warm").IsRunning);
-                Check("yeniden açılışta InitializeAsync etkin plugin'i ısıttı", warm2.GetStatus("warm").IsRunning);
+                var warm2Key = warm2.Registrations.First(x => x.Name == "warm").Key;
+                await WaitUntil(() => warm2.GetStatus(warm2Key).IsRunning);
+                Check("yeniden açılışta InitializeAsync aktif plugin'i yükledi (aynı Guid)", warm2.GetStatus(warm2Key).IsRunning);
             }
             File.Delete(warmConfig);
+
+            Console.WriteLine("\n=== 11) Constructor argümanları + JSON komutlar + katalog + durumlar ===");
+            string cfg11 = Path.Combine(Path.GetTempPath(), "dso-plugins-11-" + Guid.NewGuid().ToString("N")[..6] + ".json");
+            JsonElement Json(string s) { using var d = JsonDocument.Parse(s); return d.RootElement.Clone(); }
+            string RJ(EvokerCommandResult r) => r.ToJson();
+            await using (var m = new PluginManager(new JsonFilePluginConfigStore(cfg11), managerOptions))
+            {
+                await m.InitializeAsync();
+                const string CfgType = "TestPlugin.ConfiguredPlugin";
+                var noArgs = await m.RegisterAsync(new PluginRegistration { FilePath = dllPath, TypeFullName = CfgType });
+                Check("parametresiz oluşturulamayan tip + ConstructorArgs yok -> kayıt reddedilir, constructor'lar listelenir",
+                    !noArgs.Success && noArgs.Message.Contains("conn"), noArgs.Message);
+                var wrongNames = await m.RegisterAsync(new PluginRegistration { FilePath = dllPath, TypeFullName = CfgType, ConstructorArgs = Json("{\"baglanti\":\"x\"}") });
+                Check("uymayan isimli ConstructorArgs -> reddedilir", !wrongNames.Success, wrongNames.Message);
+
+                var sbx = await m.RegisterAsync(new PluginRegistration { Name = "Ayarlı (sandbox)", FilePath = dllPath, TypeFullName = CfgType, ConstructorArgs = Json("{\"conn\":\"Server=A\",\"level\":\"High\"}") });
+                var inp = await m.RegisterAsync(new PluginRegistration { Name = "Ayarlı (in-process)", FilePath = dllPath, TypeFullName = CfgType, Mode = PluginExecutionMode.InProcess, ConstructorArgs = Json("[\"Server=B\", 9]") });
+                Check("sandbox: isimli ConstructorArgs ile yüklendi (Running)", sbx.Success && sbx.State == PluginState.Running, sbx.Message);
+                Check("in-process: sıralı ConstructorArgs ile yüklendi (Running)", inp.Success && inp.State == PluginState.Running, inp.Message);
+                Check("ConstructorArgs JSON dosyasında saklandı", File.ReadAllText(cfg11).Contains("Server=A") && File.ReadAllText(cfg11).Contains("Server=B"));
+
+                var cat = m.Catalog;
+                Check("katalogda iki plugin hedefi (aynı Guid, Kind=Plugin, isim)", cat.Find(sbx.Key!.Value)?.Kind == "Plugin" && cat.Find(inp.Key!.Value)?.Name == "Ayarlı (in-process)");
+                var rs = await cat.ExecuteAsync(sbx.Key!.Value, "{ \"member\": \"Info\" }");
+                var ri = await cat.ExecuteAsync(inp.Key!.Value, "{ \"member\": \"Info\" }");
+                Check("sandbox komut: constructor değerleri (isimli + optional varsayılan + enum)", rs.Success && rs.Mode == "Sandbox" && rs.Result is JsonElement je && je.GetString() == "Server=A|5|High", RJ(rs));
+                Check("in-process komut: constructor değerleri (sıralı)", ri.Success && ri.Mode == "InProcess" && (string?)ri.Result == "Server=B|9|Mid", RJ(ri));
+
+                string multi = "{ \"steps\": [ { \"member\": \"Call\" }, { \"member\": \"Call\" }, { \"member\": \"SumAsync\", \"args\": { \"items\": [1,2,3] }, \"as\": \"toplam\" }, { \"member\": \"Move\", \"args\": [{ \"X\": 1, \"Y\": 2 }, 10] } ] }";
+                var ms = await cat.ExecuteAsync(sbx.Key!.Value, multi);
+                var mi = await cat.ExecuteAsync(inp.Key!.Value, multi);
+                string Strip(EvokerCommandResult r) => System.Text.RegularExpressions.Regex.Replace(r.ToJson(), "\"(elapsedMs|mode)\":[^,}]*,?", "");
+                Check("çok adımlı komut (state, async, liste, nesne argüman) sandbox'ta çalıştı", ms.Success && ms.Steps!.Count == 4, RJ(ms));
+                Check("AYNI komut sandbox ve in-process'te BİREBİR aynı JSON sonucu", Strip(ms) == Strip(mi), Strip(ms) + " <> " + Strip(mi));
+                var err = await cat.ExecuteAsync(sbx.Key!.Value, "{ \"member\": \"YokBoyle\" }");
+                Check("sandbox'ta hata kodu: MemberNotFound", !err.Success && err.Error!.Code == EvokerErrorCodes.MemberNotFound, RJ(err));
+                var sp = await cat.ExecuteAsync(sbx.Key!.Value, "{ \"member\": \"Info\", \"timeoutMs\": 5000 }");
+                Check("timeoutMs'li komut", sp.Success, RJ(sp));
+
+                // Plugin builder üzerinden doğrudan (katalogsuz)
+                var direct = await m.Get(sbx.Key!.Value).ExecuteCommandAsync(EvokerCommand.Invoke("Call"));
+                Check("IPluginBuilder.ExecuteCommandAsync (sayaç kaldığı yerden: 3)", direct.Success && direct.Result is JsonElement d3 && d3.GetInt32() == 3, RJ(direct));
+
+                // Canlı mod geçişi sonrası komut
+                await m.SetModeAsync(sbx.Key!.Value, PluginExecutionMode.InProcess);
+                var afterSwitch = await cat.ExecuteAsync(sbx.Key!.Value, "{ \"member\": \"Info\" }");
+                Check("mod değişince komut yeni modda, constructor değerleri korunur", afterSwitch.Mode == "InProcess" && (string?)afterSwitch.Result == "Server=A|5|High", RJ(afterSwitch));
+
+                // Durumlar
+                await m.DeactivateAsync(inp.Key!.Value);
+                var inactive = await cat.ExecuteAsync(inp.Key!.Value, "{ \"member\": \"Info\" }");
+                Check("pasif plugin -> Inactive (HTTP 409)", !inactive.Success && inactive.Error!.Code == EvokerErrorCodes.Inactive && EvokerErrorCodes.HttpStatus(inactive.Error.Code) == 409, RJ(inactive));
+                var desc = await cat.DescribeAsync(inp.Key!.Value, new DSO.Core.Evoker.Description.EvokerDescribeOptions { IncludeSamples = true, IncludeValues = true });
+                Check("pasif plugin'in tanımı yine verilir (şablonlarla)", desc.Methods!.Any(x => x.Name == "SumAsync" && x.Sample != null) && desc.Constructors![0].Sample != null, desc.Constructors![0].Sample?.GetRawText() ?? "");
+
+                var faulty = await m.RegisterAsync(new PluginRegistration { Name = "hatalı", FilePath = dllPath, TypeFullName = CfgType, ConstructorArgs = Json("[\"patla\"]"), Mode = PluginExecutionMode.InProcess });
+                Check("constructor hata verirse: kayıt eklenir, durum Faulted + LastError", faulty.Success && faulty.State == PluginState.Faulted && m.GetStatus(faulty.Key!.Value).LastError!.Contains("kasıtlı"), faulty.Message);
+                var faultyCall = await cat.ExecuteAsync(faulty.Key!.Value, "{ \"member\": \"Info\" }");
+                Check("Faulted plugin'e komut -> açık hata (yeniden dener, yine olmaz)", !faultyCall.Success && faultyCall.Error!.Message.Contains("kasıtlı"), RJ(faultyCall));
+                await m.UpdateAsync(faulty.Key!.Value, r => r.ConstructorArgs = Json("[\"Duzeldi\"]"));
+                var fixedSt = await m.ActivateAsync(faulty.Key!.Value);
+                Check("ConstructorArgs düzeltilince Running", fixedSt.State == PluginState.Running, fixedSt.LastError ?? "");
+                await m.UpdateAsync(faulty.Key!.Value, r => r.Name = "artık sağlam");
+                Check("sadece isim değişimi: plugin yeniden başlatılmaz, katalog adı güncellenir",
+                    m.GetStatus(faulty.Key!.Value).State == PluginState.Running && cat.Find(faulty.Key!.Value)!.Name == "artık sağlam");
+                await m.UnregisterAsync(faulty.Key!.Value);
+                Check("silinen kayıt katalogdan da çıkar", cat.Find(faulty.Key!.Value) == null);
+            }
+
+            Console.WriteLine("\n=== 12) Eski kayıt dosyasından taşıma (Id/Enabled -> Key/Name/IsActive) ===");
+            string cfg12 = Path.Combine(Path.GetTempPath(), "dso-plugins-12-" + Guid.NewGuid().ToString("N")[..6] + ".json");
+            File.WriteAllText(cfg12, "[ { \"Id\": \"erp-eski\", \"FilePath\": " + JsonSerializer.Serialize(dllPath) + ", \"TypeFullName\": \"" + TypeName + "\", \"Mode\": \"InProcess\", \"Enabled\": false } ]");
+            await using (var m12 = new PluginManager(new JsonFilePluginConfigStore(cfg12), managerOptions))
+            {
+                await m12.InitializeAsync();
+                var reg = m12.Registrations.Single();
+                Check("eski Id -> Name, yeni Guid Key, Enabled=false -> IsActive=false", reg.Name == "erp-eski" && reg.Key != Guid.Empty && !reg.IsActive);
+                var text = File.ReadAllText(cfg12);
+                Check("dosya yeni biçimde yeniden yazıldı (Id/Enabled alanları yok)", text.Contains("\"Key\"") && !text.Contains("\"Id\"") && !text.Contains("\"Enabled\""), text.Length.ToString());
+            }
+            File.Delete(cfg11);
+            File.Delete(cfg12);
 
             await mgr.DisposeAsync();
             await mgr2.DisposeAsync();
@@ -1917,8 +2026,8 @@ namespace DSO.Core.Evoker.Plugins.TestApi
             string cfg = Path.Combine(Path.GetTempPath(), "perf-plugins-" + Guid.NewGuid().ToString("N")[..6] + ".json");
             await using var mgr = new PluginManager(new JsonFilePluginConfigStore(cfg), new PluginManagerOptions { HostPath = host, NotifyOnCrash = false });
             await mgr.InitializeAsync();
-            await mgr.RegisterAsync(new PluginRegistration { Id = "perf-in", FilePath = dll, TypeFullName = T, Mode = PluginExecutionMode.InProcess });
-            var proxy = mgr.Get("perf-in");
+            var perfReg = await mgr.RegisterAsync(new PluginRegistration { Name = "perf-in", FilePath = dll, TypeFullName = T, Mode = PluginExecutionMode.InProcess });
+            var proxy = mgr.Get(perfReg.Key!.Value);
             proxy.Invoke<int>("Add", 1, 1);
             Add("D", "D1 proxy.Invoke<int>", Measure(N / 2, () => x = proxy.Invoke<int>("Add", x & 1023, 1)));
             var proxyFunc = proxy.GetFunc<int>("Add", new object?[] { 0, 0 });
@@ -2039,8 +2148,5 @@ namespace DSO.Core.Evoker.Plugins.TestApi
     public class MapDstReadOnly { public int X { get; } = 77; public int Y { get; set; } }
     public class MapDstLower { public int x { get; set; } public int Y { get; set; } }
 }
-
-
-
-
-
+ 
+ 

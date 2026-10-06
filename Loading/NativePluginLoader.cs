@@ -21,7 +21,7 @@ namespace DSO.Core.Evoker.Plugins.Loading
 
         public object? Instance => null;
 
-        public Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false)
+        public Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false, System.Text.Json.JsonElement? constructorArgs = null)
             => throw new NotSupportedException(
                 "Native/başka-runtime plugin yükleme henüz implemente edilmedi. " +
                 "Bkz. NativePluginLoader.cs üstündeki not.");

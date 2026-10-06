@@ -1,0 +1,92 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!--
+    Örnek Web API (.NET 6). Derlenince çıktı klasörü (bin\Debug\net6.0\) şöyle olur:
+      DSO.Core.Evoker.Plugins.DemoApi.exe/.dll, appsettings.json, DSO.Core.Evoker*.dll ...
+      Host\       sandbox worker'ı (DSO.Core.Evoker.PluginHost + bağımlılıkları)  - CopyWorkerToHost
+      Plugins\    örnek plugin'ler: Siparis\1.0, Stok\v1, Stok\v2, Rapor\1.0      - CopyDemoPlugins
+      App_Data\   kayıtlar (plugins.json) + crash.log (çalışınca oluşur)
+    Kütüphane yollarını (..\..\DSO.Core.Evoker.*) kendi çözüm yapınıza göre düzenleyin.
+  -->
+  
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Swagger UI (/swagger). Paket indirilemeyen ortamda: dotnet build -p:EnableSwagger=false -->
+    <EnableSwagger Condition="'$(EnableSwagger)' == ''">true</EnableSwagger>
+    <DefineConstants Condition="'$(EnableSwagger)' == 'true'">$(DefineConstants);SWAGGER</DefineConstants>
+    <WorkerProject>..\DSO.Core.Evoker.PluginHost\DSO.Core.Evoker.PluginHost.csproj</WorkerProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\DSO.Core.Evoker.Plugins.Api\DSO.Core.Evoker.Plugins.Api.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(EnableSwagger)' == 'true'">
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
+  </ItemGroup>
+
+  <!--
+    Örnek plugin'ler ve sandbox worker'ı DemoApi'ye REFERANS DEĞİL (kod bağımlılığı yok). DemoApi derlenince aşağıdaki
+    target'lar önce bunları restore edip derler, sonra çıktılarını bin\...\Host\ ve bin\...\Plugins\<Folder>\ altına
+    kopyalar. Solution'a eklenmeleri gerekmez (Visual Studio solution dışı projeleri kendisi restore etmez - bu yüzden
+    restore burada yapılır).
+  -->
+  <ItemGroup>
+    <DemoPlugin Include="DemoPlugins\Siparis\Siparis.csproj" Folder="Siparis\1.0" />
+    <DemoPlugin Include="DemoPlugins\Stok.v1\Stok.vbproj" Folder="Stok\v1" />
+    <DemoPlugin Include="DemoPlugins\Stok.v2\Stok.vbproj" Folder="Stok\v2" />
+    <DemoPlugin Include="DemoPlugins\Rapor\Rapor.csproj" Folder="Rapor\1.0" />
+    <!-- Plugin kaynakları değişince Visual Studio DemoApi'yi "güncel" sayıp atlamasın -->
+    <UpToDateCheckInput Include="DemoPlugins\**\*.cs;DemoPlugins\**\*.vb;DemoPlugins\**\*.*proj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="DemoPlugins\**\obj\**" />
+    <Content Remove="DemoPlugins\**\obj\**" />
+    <EmbeddedResource Remove="DemoPlugins\**\obj\**" />
+    <None Remove="DemoPlugins\**\obj\**" />
+    <UpToDateCheckInput Remove="DemoPlugins\**\obj\**" />
+  </ItemGroup>
+
+
+  <!-- Sandbox worker'ını restore + derleyip bin\...\Host\ altına kopyalar -->
+  <Target Name="CopyWorkerToHost" AfterTargets="Build">
+    <!-- Restore ayrı bir özellik setiyle çağrılır: sonraki Build yeniden değerlendirilir ve restore çıktısını görür -->
+    <MSBuild Projects="$(WorkerProject)" Targets="Restore" Properties="Configuration=$(Configuration);_EvokerDemoRestore=true" RemoveProperties="TargetFramework;RuntimeIdentifier" />
+    <MSBuild Projects="$(WorkerProject)" Targets="Build" Properties="Configuration=$(Configuration);TargetFramework=$(TargetFramework)" RemoveProperties="RuntimeIdentifier">
+      <Output TaskParameter="TargetOutputs" ItemName="_WorkerOutput" />
+    </MSBuild>
+    <PropertyGroup>
+      <_WorkerDir>@(_WorkerOutput->'%(RootDir)%(Directory)')</_WorkerDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <_WorkerFiles Include="$(_WorkerDir)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_WorkerFiles)" DestinationFiles="@(_WorkerFiles->'$(OutDir)Host\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Sandbox worker -&gt; $(OutDir)Host" />
+  </Target>
+
+  <!-- Her örnek plugin için bir kez çalışır (target batching) -->
+  <Target Name="CopyDemoPlugins" AfterTargets="Build" Outputs="%(DemoPlugin.Identity)">
+    <ItemGroup>
+      <_PluginOutput Remove="@(_PluginOutput)" />
+      <_PluginFiles Remove="@(_PluginFiles)" />
+    </ItemGroup>
+    <MSBuild Projects="@(DemoPlugin)" Targets="Restore" Properties="Configuration=$(Configuration);_EvokerDemoRestore=true" RemoveProperties="TargetFramework;RuntimeIdentifier" />
+    <MSBuild Projects="@(DemoPlugin)" Targets="Build" Properties="Configuration=$(Configuration)" RemoveProperties="TargetFramework;RuntimeIdentifier">
+      <Output TaskParameter="TargetOutputs" ItemName="_PluginOutput" />
+    </MSBuild>
+    <PropertyGroup>
+      <_PluginDir>@(_PluginOutput->'%(RootDir)%(Directory)')</_PluginDir>
+      <_PluginName>@(_PluginOutput->'%(Filename)')</_PluginName>
+      <_PluginFolder>@(DemoPlugin->'%(Folder)')</_PluginFolder>
+    </PropertyGroup>
+    <ItemGroup>
+      <_PluginFiles Include="$(_PluginDir)$(_PluginName).dll;$(_PluginDir)$(_PluginName).pdb;$(_PluginDir)$(_PluginName).deps.json" />
+      <_PluginFiles Remove="@(_PluginFiles)" Condition="!Exists('%(FullPath)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_PluginFiles)" DestinationFolder="$(OutDir)Plugins\$(_PluginFolder)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Plugin -&gt; $(OutDir)Plugins\$(_PluginFolder)" />
+  </Target>
+
+</Project>

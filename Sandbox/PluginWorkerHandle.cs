@@ -35,6 +35,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         // TODO 13
         private readonly ConcurrentDictionary<long, TaskCompletionSource<InvokeReply>> _pending = new();
         private readonly ConcurrentDictionary<long, TaskCompletionSource<InvokeBatchReply>> _pendingBatch = new();
+        private readonly ConcurrentDictionary<long, TaskCompletionSource<string>> _pendingCommands = new();
         private long _correlationCounter;
         // Resolve'un kendi CorrelationId'si YOK (bkz. ResolveMessages.cs) - bu yüzden aynı anda
         // sadece BİR Resolve isteği beklenebilir, bu kilit onu garanti eder.
@@ -111,13 +112,24 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         /// <summary>Worker process'inin OS process id'si - tanılama/gözlemleme amaçlı (ör. testte kasıtlı kill etmek için). StartAsync öncesi/sonrası dispose edilmişse null.</summary>
         public int? ProcessId { get { try { return _process?.Id; } catch (InvalidOperationException) { return null; } } }
 
-        public PluginWorkerHandle(string pluginFilePath, string typeFullName, PluginWorkerOptions options, bool includeNonPublic = false)
+        /// <param name="constructorArgs">
+        /// Plugin'in constructor argümanları (JSON dizi ya da parametre adlarıyla nesne). Worker'a bağlantıdan hemen sonra
+        /// Init mesajıyla gider (komut satırında görünmez); her yeniden başlatmada aynı değerler kullanılır. null =
+        /// parametresiz ya da tüm parametreleri optional constructor.
+        /// </param>
+        public PluginWorkerHandle(string pluginFilePath, string typeFullName, PluginWorkerOptions options, bool includeNonPublic = false,
+            System.Text.Json.JsonElement? constructorArgs = null)
         {
             PluginFilePath = pluginFilePath ?? throw new ArgumentNullException(nameof(pluginFilePath));
             TypeFullName = typeFullName ?? throw new ArgumentNullException(nameof(typeFullName));
             Options = options ?? throw new ArgumentNullException(nameof(options));
             IncludeNonPublic = includeNonPublic;
+            ConstructorArgsJson = constructorArgs is { ValueKind: not (System.Text.Json.JsonValueKind.Undefined or System.Text.Json.JsonValueKind.Null) } c
+                ? c.GetRawText() : null;
         }
+
+        /// <summary>Worker'a Init ile gönderilen constructor argümanları (JSON) - null = argümansız.</summary>
+        public string? ConstructorArgsJson { get; }
 
         /// <summary>TODO 15: Process.Start (worker) + pipe bağlantısı + Hello handshake.</summary>
         public Task StartAsync()
@@ -215,6 +227,16 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
 
             var writer = new IpcWriter(pipeServer);
             var reader = new IpcReader(pipeServer);
+
+            // Protokol v2: plugin yüklenmeden ÖNCE constructor argümanları (eski worker bunu okumaz; Hello'daki sürüm
+            // kontrolünde zaten reddedilir).
+            try { await writer.WriteInitAsync(ConstructorArgsJson).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                KillQuietly(process);
+                pipeServer.Dispose();
+                throw new InvalidOperationException("[PluginWorkerHandle] Worker'a başlangıç (Init) mesajı gönderilemedi.", ex);
+            }
 
             IpcMessageType helloType;
             byte[] helloPayload;
@@ -427,6 +449,31 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
         }
 
         /// <summary>
+        /// JSON komutu (DSO.Core.Evoker.Commands.EvokerCommand) worker İÇİNDE çalıştırır - worker plugin'in gerçek tipleriyle
+        /// in-process ile AYNI çalıştırıcıyı (EvokerTarget) kullanır, sonuç JSON'u (EvokerCommandResult) döner. Concurrency
+        /// gate'ten bir çağrı gibi geçer. timeoutMs sadece bu bekleyişi keser (worker etkilenmez).
+        /// </summary>
+        public async Task<string> ExecuteCommandAsync(string commandJson, int? timeoutMs = null)
+        {
+            EnsureAlive();
+            await _concurrencyGate!.WaitAsync().ConfigureAwait(false);
+            long correlationId = Interlocked.Increment(ref _correlationCounter);
+            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingCommands[correlationId] = tcs;
+            try
+            {
+                await _writer!.WriteCommandAsync(correlationId, commandJson).ConfigureAwait(false);
+                if (timeoutMs.HasValue) await WaitWithTimeoutAsync(tcs.Task, timeoutMs.Value, "Command").ConfigureAwait(false);
+                return await tcs.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                _pendingCommands.TryRemove(correlationId, out _);
+                _concurrencyGate.Release();
+            }
+        }
+
+        /// <summary>
         /// (metot adı, argüman tip şekli) için public handle - cache'li; restart sonrası cache temizlenir.
         /// CallRawAsync ve SandboxBuilder'ın toplu çağrısı bunu kullanır.
         /// </summary>
@@ -614,6 +661,12 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                                 tcs.TrySetResult(reply);
                             break;
 
+                        case IpcMessageType.CommandReply:
+                            var (commandId, resultJson) = IpcMessageCodec.DecodeJsonMessage(payload);
+                            if (_pendingCommands.TryRemove(commandId, out var ctcs2))
+                                ctcs2.TrySetResult(resultJson);
+                            break;
+
                         case IpcMessageType.InvokeBatchReply:
                             var batchReply = IpcMessageCodec.DecodeInvokeBatchReply(payload);
                             if (_pendingBatch.TryRemove(batchReply.CorrelationId, out var btcs))
@@ -643,6 +696,12 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             catch (OperationCanceledException)
             {
                 // Normal kapanış (DisposeAsync/PromoteToInProcessAsync CancellationToken'ı iptal etti).
+            }
+            catch (Exception ex) when (Volatile.Read(ref _disposed) || _promoted)
+            {
+                // Bilerek kapatıldı (DisposeAsync / in-process'e terfi): worker Shutdown'ı alıp çıktığı için pipe
+                // iptalden ÖNCE kapanabilir - bu bir çökme DEĞİL; Crashed olayı ve crash log'u yok.
+                MarkDeadAndFailPending(new ObjectDisposedException("Worker kapatıldı.", ex));
             }
             catch (Exception ex)
             {
@@ -692,6 +751,7 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
             Interlocked.Exchange(ref _missedHeartbeats, 0);
             _pending.Clear();
             _pendingBatch.Clear();
+            _pendingCommands.Clear();
 
             await LaunchAsync().ConfigureAwait(false);
 
@@ -782,6 +842,11 @@ namespace DSO.Core.Evoker.Plugins.Sandbox
                 return; // zaten dead işaretlenmiş - idempotent
 
             _pendingResolve?.TrySetException(reason);
+            foreach (var kvp in _pendingCommands)
+            {
+                if (_pendingCommands.TryRemove(kvp.Key, out var ctcs))
+                    ctcs.TrySetException(reason);
+            }
             foreach (var kvp in _pendingBatch)
             {
                 if (_pendingBatch.TryRemove(kvp.Key, out var btcs))

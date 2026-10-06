@@ -32,7 +32,8 @@ namespace DSO.Core.Evoker.Plugins.Loading
         /// güvendiğiniz plugin'ler için bilinçli bir tercih olarak açın; "yabancı" bir DLL'in iç
         /// durumuna serbestçe erişmek güvenlik sınırını genişletir.
         /// </summary>
-        Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false);
+        /// <param name="constructorArgs">Constructor argümanları JSON (dizi ya da isimli nesne); null = parametresiz / tüm parametreleri optional constructor.</param>
+        Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false, System.Text.Json.JsonElement? constructorArgs = null);
 
         /// <summary>
         /// Loader-türü bilinmeyen genel çağırıcılar için ince bir köprü. Managed tarafta

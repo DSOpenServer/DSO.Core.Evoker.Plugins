@@ -52,11 +52,14 @@ namespace DSO.Core.Evoker.Plugins.Loading
         private WeakReference? _contextRef;
 
         /// <summary>
-        /// Plugin DLL'ini kendi PluginLoadContext'ine yükler, tipi bulur (ignoreCase - VB.NET), parametresiz
-        /// constructor'la BİR instance oluşturur. includeNonPublic: bkz. IPluginLoader. Bir loader üzerinde
-        /// bir kez çağrılabilir.
+        /// Plugin DLL'ini kendi PluginLoadContext'ine yükler, tipi bulur (ignoreCase - VB.NET) ve BİR instance oluşturur.
+        /// <paramref name="constructorArgs"/>: constructor argümanları JSON olarak (dizi ya da parametre adlarıyla nesne);
+        /// verilmezse parametresiz ya da tüm parametreleri optional olan constructor kullanılır. Constructor seçimi metot
+        /// seçimiyle aynı kural (bkz. DSO.Core.Evoker.Commands.EvokerTarget.CreateInstance). includeNonPublic: bkz.
+        /// IPluginLoader. Bir loader üzerinde bir kez çağrılabilir.
         /// </summary>
-        public Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false)
+        public Task LoadInProcessAsync(string filePath, string typeFullName, bool includeNonPublic = false,
+            System.Text.Json.JsonElement? constructorArgs = null)
         {
             if (Instance != null || IsUnloaded)
                 throw new InvalidOperationException(
@@ -78,13 +81,17 @@ namespace DSO.Core.Evoker.Plugins.Loading
                 object instance;
                 try
                 {
-                    instance = DynamicEntityAccessor.GetConstructor(type, includeNonPublic)();
+                    instance = DSO.Core.Evoker.Commands.EvokerTarget.CreateInstance(type, constructorArgs, includeNonPublic);
                 }
-                catch (MissingMethodException ex)
+                catch (DSO.Core.Evoker.Commands.EvokerCommandException ex) when (ex.Code != DSO.Core.Evoker.Commands.EvokerErrorCodes.TargetException)
                 {
-                    throw new MissingMethodException(
-                        $"'{type.FullName}' türünün{(includeNonPublic ? "" : " (public)")} parametresiz " +
-                        "constructor'ı yok - plugin tipleri şu an parametresiz constructor'a sahip olmalı.", ex);
+                    // Uyan constructor yok / argüman çevrilemedi - çağıran hatası (eskisiyle aynı tip).
+                    throw new MissingMethodException($"'{type.FullName}' oluşturulamadı: {ex.Message}", ex);
+                }
+                catch (DSO.Core.Evoker.Commands.EvokerCommandException ex)
+                {
+                    // Plugin'in kendi constructor'ı hata verdi - asıl exception iç hata olarak korunur.
+                    throw new PluginInvocationException(".ctor", ex.TargetExceptionType, ex.Message, ex.InnerException);
                 }
 
                 LoadContext = context;

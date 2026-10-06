@@ -13,9 +13,10 @@
     /// KURAL: protokolde (mesaj tipi, payload düzeni, worker davranışı) her değişiklikte bu sayı artırılır.
     ///   0 = sürüm bildirmeyen eski worker'lar (bu kontrol eklenmeden önceki tüm build'ler)
     ///   1 = Member/EventRaised/InvokeBatch mesajları, FindMethod tabanlı resolve, CurrentUserOnly pipe
+    ///   2 = Init (host → worker, bağlantıdan hemen sonra: constructor argümanları), Command/CommandReply (JSON komut worker içinde)
     /// </summary>
     public static class IpcProtocol
     {
-        public const int Version = 1;
+        public const int Version = 2;
     }
 }

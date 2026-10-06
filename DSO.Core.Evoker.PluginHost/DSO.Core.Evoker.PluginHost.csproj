@@ -2,17 +2,31 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Worker iki hedefle derlenir; PluginManagerOptions.HostPath, host uygulamanın runtime'ına uygun çıktıyı
+         göstermeli (bin/Release/net6.0/ ya da bin/Release/net8.0/). -->
+    <TargetFrameworks>net6.0</TargetFrameworks>
     <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <RootNamespace>DSO.Core.Evoker.PluginHost</RootNamespace>
     <AssemblyName>DSO.Core.Evoker.PluginHost</AssemblyName>
+  </PropertyGroup>
+
+  <!-- BAŞLATMA SÜRESİ (optimizasyon #7). Worker'ın açılışı ~ yarı yarıya .NET runtime'ın kendisi, yarı yarıya
+       bizim kodumuzun JIT derlemesi (pipe bağlantısı, plugin yükleme, IPC/EvokerBuilder ilk çağrıları).
+       ReadyToRun bu ikinci kısmı önceden derler. Sadece publish'te ve RID verilince etkin olur:
+         dotnet publish DSO.Core.Evoker.PluginHost -c Release -r win-x64 (self-contained kapalı) -o [çıktı klasörü]
+       Normal "dotnet build" çıktısı bundan etkilenmez (geliştirmede aynen çalışır).
+       NOT: InvariantGlobalization BİLEREK açılmadı - açılırsa ICU yüklenmez (birkaç ms kazanç) ama plugin'lerin
+       kültüre bağlı işlemleri (Türkçe sıralama, ToUpper("i") vb.) değişir. -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- Worker process: DSO.Core.Evoker.Plugins.Sandbox içindeki protokol tiplerini,
          DSO.Core.Evoker.Plugins.Loading.ManagedDotNetPluginLoader'ı ve dolayısıyla
-         EvokerEngine'i (Plugins projesi üzerinden) kullanır. -->    
+         EvokerEngine'i (Plugins projesi üzerinden) kullanır. -->
     <ProjectReference Include="..\DSO.Core.Evoker.Plugins.csproj" />
   </ItemGroup>
 
